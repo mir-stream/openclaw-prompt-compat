@@ -158,7 +158,7 @@ npm pack
 npm publish --access public
 
 openclaw plugins install \
-  "npm:@mir-stream/openclaw-prompt-compat@0.1.0" \
+  "npm:@mir-stream/openclaw-prompt-compat@0.2.0" \
   --pin
 ```
 
@@ -193,7 +193,7 @@ Z.AI 검증은 별도 임시 `HOME`, `OPENCLAW_STATE_DIR`, `OPENCLAW_CONFIG_PATH
 
 - 기본 OpenClaw 버전과 도움말·배포 문서를 `2026.7.1`로 올린다.
 - OpenClaw `2026.7.1`의 Node engine 범위를 검사한다.
-- `--prompt-compat-version` 기본값을 `0.1.0`으로 둔다.
+- `--prompt-compat-version` 기본값을 `0.2.0`으로 둔다.
 - 미설치 상태에서만 exact npm package를 신규 설치한다.
 - 설치돼 있고 명시적으로 disabled이면 update·install·enable하지 않는다.
 - 설치돼 있고 enabled이면 exact pinned npm registry record로 수렴시킨다. 같은 manifest version이어도
@@ -205,7 +205,8 @@ Z.AI 검증은 별도 임시 `HOME`, `OPENCLAW_STATE_DIR`, `OPENCLAW_CONFIG_PATH
   수행한다.
 
 npm package가 게시되기 전에는 이 setup 변경을 공개 배포하지 않는다. 로컬 코드 통합과 shell 검증을
-먼저 끝내고, `0.1.0` 게시 후 package install acceptance를 다시 통과시킨 뒤 배포한다.
+먼저 끝내고, 해당 version 게시 후 package install acceptance를 다시 통과시킨 뒤 배포한다. `0.2.0`은
+아직 게시 전이다.
 
 ## 7. 롤백
 

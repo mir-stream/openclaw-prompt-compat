@@ -1,0 +1,76 @@
+{
+  "name": "@mir-stream/openclaw-prompt-compat",
+  "version": "0.1.0",
+  "description": "Fingerprint-scoped OpenClaw system-prompt identity compatibility transform.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mir-stream/openclaw-prompt-compat.git"
+  },
+  "homepage": "https://github.com/mir-stream/openclaw-prompt-compat#readme",
+  "bugs": {
+    "url": "https://github.com/mir-stream/openclaw-prompt-compat/issues"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md",
+    "openclaw.plugin.json"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/*.test.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepack": "npm run build",
+    "pack": "npm pack --dry-run"
+  },
+  "engines": {
+    "node": ">=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.7.1"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "typescript": "6.0.3"
+  },
+  "openclaw": {
+    "build": {
+      "openclawVersion": "2026.7.1",
+      "pluginSdkVersion": "2026.7.1"
+    },
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "install": {
+      "npmSpec": "@mir-stream/openclaw-prompt-compat",
+      "defaultChoice": "npm",
+      "minHostVersion": ">=2026.7.1"
+    },
+    "compat": {
+      "pluginApi": ">=2026.7.1"
+    }
+  },
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "prompt-compatibility"
+  ]
+}

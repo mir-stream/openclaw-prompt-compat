@@ -1,36 +1,36 @@
-# OpenClaw 프롬프트 호환 플러그인 — 독립 배포 설계
+# OpenClaw 시스템 프롬프트 호환 플러그인
 
 작성: 2026-07-23
-상태: **구현 전 설계안**
-검증 기준: OpenClaw `2026.6.11`
+상태: **플러그인 구현·npm 0.1.0 게시·게시본 acceptance 완료, setup 배포 전**
+검증 기준: OpenClaw `2026.7.1` (`v2026.7.1`, commit
+`2d2ddc43d0dcf71f31283d780f9fe9ff4cc04fe4`)
 
 ## 0. 결정
 
-- 이 기능은 기존 `rota-approval-gate`에 합치지 않는다.
-- 프롬프트 호환 기능만 담은 독립 GitHub 저장소와 독립 OpenClaw 플러그인을 만든다.
-- 플러그인은 **npm에 직접 게시하고 `npm:` source로 직접 설치**한다.
-- ClawHub에는 게시하지 않고 설치·업데이트 경로에서도 사용하지 않는다.
-- `curl -fsSL https://dl.rotacrew.kr/setup_openclaw | bash`가 npm 플러그인을 함께 설치하도록 연결한다.
-- 기존 `rota-approval-gate`의 코드와 배포 경로는 그대로 둔다.
+- OpenClaw 본체를 패치하지 않고 독립 npm 플러그인으로 구현한다.
+- provider·model별 분기 없이 모든 embedded agent run에 같은 규칙을 적용한다.
+- OpenClaw가 만든 system prompt를 식별할 수 있는 구조적 지문이 있을 때만 첫 문장을 바꾼다.
+- 일반적인 user·assistant·tool 메시지와 tool-call 인자는 바뀌지 않도록 높은 변별력을 갖는 지문을
+  사용한다.
+- 공격자가 OpenClaw 내부 prompt 구조 전체를 의도적으로 복제한 경우까지 system prompt와 구별하는
+  보안 경계는 목표로 하지 않는다. 현재 공개 API로는 그 보장이 불가능하다는 사실은 명시한다.
+- 기존 `rota-approval-gate`의 코드와 배포 경로는 합치지 않는다.
+- npm에 직접 게시하고 `npm:` source로 설치한다. ClawHub에는 게시하지 않는다.
 
-초기 구현 작업명은 다음과 같다.
+구현 식별자는 다음과 같다.
 
-| 구분 | 이름 |
+| 구분 | 값 |
 | --- | --- |
 | GitHub 저장소 | `mir-stream/openclaw-prompt-compat` |
-| npm 패키지 | `@rotacrew/openclaw-prompt-compat` |
+| npm 패키지 | `@mir-stream/openclaw-prompt-compat` |
 | OpenClaw plugin ID | `openclaw-prompt-compat` |
 | 최초 버전 | `0.1.0` |
+| 최소 OpenClaw 버전 | `2026.7.1` |
 
-```text
-독립 GitHub 저장소 → npm publish → OpenClaw npm 설치 → setup_openclaw에 포함
-```
+## 1. 변경하는 문구
 
-## 1. 플러그인 동작
-
-OpenClaw `2026.6.11`의 기본 시스템 프롬프트 첫 문장은 Z.AI Coding Plan의 GLM-5.2 endpoint에서
-HTTP `429`, error code `1305`를 일으키는 것으로 재현됐다. 문장의 의미를 유지한 최소 치환으로 이를
-회피한다.
+원인 문구는 여러 차례 비교 검증된 것으로 보고 추가 원인 A/B 실험은 구현 조건으로 두지 않는다.
+변경은 다음 한 문장으로 제한한다.
 
 ```text
 You are a personal assistant running inside OpenClaw.
@@ -38,118 +38,196 @@ You are a personal assistant running inside OpenClaw.
 You are a personal assistant running within OpenClaw.
 ```
 
-구현은 `registerTextTransforms`에 input 규칙 하나를 등록하는 것이 전부다.
+provider payload 전체나 user prompt를 수정하지 않고, OpenClaw system prompt의 해당 identity span만
+치환한다.
+
+## 2. 식별 지문과 구현
+
+플러그인은 `registerTextTransforms`에 input replacement 하나만 등록한다.
 
 ```ts
-import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+const identityPattern =
+  "You are a personal assistant running inside OpenClaw\\.";
+const toolingPreamble =
+  "Available tools are policy-filtered\\. Names are case-sensitive; call exactly as listed\\.";
 
-export const promptCompatibilityInput = [{
-  from: /^You are a personal assistant running inside OpenClaw\.(?=\n|$)/,
-  to: "You are a personal assistant running within OpenClaw.",
-}];
-
-export default definePluginEntry({
-  id: "openclaw-prompt-compat",
-  name: "OpenClaw Prompt Compatibility",
-  description: "Rewrites a known provider-incompatible OpenClaw prompt signature",
-  register(api) {
-    api.registerTextTransforms({ input: promptCompatibilityInput });
-  },
-});
+new RegExp(
+  `^${identityPattern}(?=` +
+    `\\n## Tooling\\n${toolingPreamble}\\n` +
+    `(?=([\\s\\S]*?(?<![^\\n])## Workspace Files \\(injected\\)\\n))\\1` +
+    `(?=([\\s\\S]*?(?<![^\\n])<!-- OPENCLAW_CACHE_BOUNDARY -->\\n))\\2` +
+    `(?=([\\s\\S]*?(?<![^\\n])## Runtime\\n))\\3` +
+    ")",
+);
 ```
 
-- 정확한 문장으로 시작하는 문자열만 바꾼다.
-- provider·model 분기, 사용자 정의 정규식, output 변환, 승인 훅은 넣지 않는다.
-- 별도 설정도 두지 않는다. 끄려면 독립 플러그인 자체를 disable한다.
-- API가 agent·provider·message role context를 주지 않으므로 설치된 gateway 전체에 적용된다. 이 때문에
-  매치 범위를 정확한 첫 줄로 제한한다.
+치환 대상 문장이 다음 조건을 모두 만족할 때만 match한다.
 
-## 2. 독립 저장소와 npm 배포
+1. 문자열 절대 시작에 정확한 identity 문장이 있다.
+2. 바로 다음 줄이 `## Tooling`이다.
+3. 그 다음 줄이 OpenClaw 2026.7.1의 고정 문구
+   `Available tools are policy-filtered. Names are case-sensitive; call exactly as listed.`이다.
+4. 뒤에 `## Workspace Files (injected)`가 있다.
+5. 그 뒤에 내부 cache boundary marker가 있다.
+6. marker 뒤에 `## Runtime`이 있다.
 
-새 저장소는 플러그인 소스, manifest, 단위 테스트, 빌드 설정, GitHub Actions만 가진다.
+정규식은 non-global이다. 절대 시작 anchor `^`가 exact identity와 고정 Tooling preamble이 prompt
+root에 있는지 확인한다. 따라서 prepend된 context 안에 일반적인 `identity + ## Tooling` 인용문이나
+exact 3줄 scaffold가 있어도 실제 prompt의 뒤쪽 marker를 빌릴 수 없다. 임의의 prefix와 OpenClaw
+hook `prependSystemContext`가 앞에 붙은 경우는 허용하지 않고 fail closed한다.
 
-- npm package에는 빌드된 `dist/index.js`와 `openclaw.plugin.json`을 포함한다.
-- OpenClaw 호환 범위는 `>=2026.6.11`로 선언한다.
-- manifest config schema는 빈 strict object로 둔다.
-- CI는 `npm test`, `npm run build`, `npm pack --dry-run`을 실행한다.
-- npm 게시 전 packed tgz를 OpenClaw `2026.6.11`에 설치해 runtime load를 확인한다.
+marker 구간들은 atomic lookahead capture 뒤 backreference로 그대로 소비한다. 실제 match span은 identity
+문장 하나뿐이며 replacement도 호환 identity 한 문장이다. 이 구조는 exact scaffold나 Workspace/cache
+marker를 반복한 실패 입력에서 suffix를 후보마다 다시 훑는 제곱·조합 backtracking도 막는다.
 
-릴리스는 GitHub tag와 npm version을 맞춘 뒤 public package로 게시한다.
+각 marker는 앞쪽 newline을 gap에 강제하지 않고 line-start lookbehind로 확인한다. 따라서 Tooling,
+Workspace Files, cache boundary, Runtime 사이에 내용이 하나도 없는 최소 prompt도 match한다.
+
+다음 입력은 fail closed로 그대로 둔다.
+
+- identity 문장만 있는 일반 메시지
+- 문장 중간에 들어간 identity 문장
+- 임의 텍스트나 hook `prependSystemContext`가 core prompt 앞에 붙은 문자열
+- `promptMode: "none"`의 한 줄 prompt
+- 고정 Tooling preamble, heading·공백·대소문자·marker 순서가 다른 prompt
+- 필요한 section이나 cache marker가 빠진 prompt
+
+## 3. 공개 API의 잔여 한계
+
+OpenClaw `2026.7.1`의 `registerTextTransforms`는 role 정보를 주지 않는다. 등록된 input replacement는
+provider-bound system prompt뿐 아니라 message content, history, tool result, tool-call argument의 문자열에도
+재귀 적용될 수 있다.
+
+따라서 이 구현의 정확한 보장은 다음과 같다.
+
+- 일반적인 메시지에 identity 문장만 복사한 경우에는 지문이 없어 바뀌지 않는다.
+- 실제 OpenClaw system prompt는 구조적 지문을 만족하므로 바뀐다.
+- user/tool/history가 exact identity, 2026.7.1 고정 Tooling preamble, 뒤쪽 marker 구조를 의도적으로
+  복제하면 match할 수 있다.
+
+마지막 경우까지 차단하려면 OpenClaw가 role-scoped system prompt transform API를 새로 제공해야 한다.
+이번 요구사항은 의도적으로 위조한 내부 prompt와의 적대적 구별이 아니라 실사용에서의 안정적인 변별이므로,
+현재 지문 방식을 채택한다.
+
+## 4. 패키지 구조
+
+배포 artifact에는 실행에 필요한 파일만 포함한다.
+
+```text
+dist/index.js
+dist/index.js.map
+dist/index.d.ts
+dist/index.d.ts.map
+openclaw.plugin.json
+package.json
+README.md
+LICENSE
+```
+
+- manifest는 `activation.onStartup: true`와 빈 strict config schema를 선언한다.
+- `package.json#openclaw.extensions`는 build된 `./dist/index.js`를 가리킨다.
+- `openclaw.compat.pluginApi`와 `openclaw.build.openclawVersion`은 `2026.7.1` 계약을 명시한다.
+- runtime dependency와 사용자 설정은 없다.
+- 플러그인을 끄려면 plugin 자체를 disable한다.
+
+게시 전 검증 명령은 다음과 같다.
 
 ```sh
 npm ci
 npm test
+npm run typecheck
 npm run build
+npm pack
+```
+
+게시와 설치는 다음 exact version을 사용한다.
+
+```sh
 npm publish --access public
-```
-
-가능하면 GitHub Actions의 npm trusted publishing을 사용한다. ClawHub metadata나 publish 단계,
-`dl.rotacrew.kr`용 plugin tgz mirror는 만들지 않는다.
-
-직접 설치 명령은 다음과 같다.
-
-```sh
-openclaw plugins install \
-  "npm:@rotacrew/openclaw-prompt-compat@0.1.0" \
-  --pin --force
-openclaw plugins inspect openclaw-prompt-compat --runtime --json
-```
-
-## 3. `setup_openclaw` 통합
-
-현재 저장소에서는 `openclaw-plugin/deploy/public/setup_openclaw`와 해당 배포 문서만 수정한다.
-기존 approval gate 설치 단계 옆에 다음 독립 단계를 추가한다.
-
-```sh
-local PROMPT_COMPAT_VERSION="0.1.0"
 
 openclaw plugins install \
-  "npm:@rotacrew/openclaw-prompt-compat@${PROMPT_COMPAT_VERSION}" \
-  --pin --force
-
-openclaw plugins inspect openclaw-prompt-compat --runtime --json
+  "npm:@mir-stream/openclaw-prompt-compat@0.1.0" \
+  --pin
 ```
 
-- `--prompt-compat-version <ver>` 옵션으로 exact version을 바꿀 수 있게 한다.
-- 기본값은 검증된 버전으로 고정하고, 재실행 시 같은 npm package/version으로 수렴시킨다.
-- `dl.rotacrew.kr`는 setup 스크립트만 제공하며 플러그인 바이트는 npm에서 받는다.
-- 기존 머신도 같은 setup one-liner를 다시 실행하면 플러그인이 설치된다.
-- 기존 `rota-approval-gate` 설치·검증 단계는 변경하지 않는다.
+## 5. 검증 결과
 
-## 4. 검증
+2026-07-23에 다음 검증을 완료했다.
 
-단위 테스트는 다음 경계만 고정한다.
-
-| 입력 | 기대 |
+| 검증 | 결과 |
 | --- | --- |
-| 정확한 문장 하나 | `inside`만 `within`으로 변경 |
-| 정확한 첫 줄 + 나머지 프롬프트 | 첫 줄만 변경 |
-| 앞에 다른 텍스트가 있음 | 변경 없음 |
-| 공백·대소문자가 다름 | 변경 없음 |
-| 다른 위치의 동일 문장 | 변경 없음 |
+| identity·고정 Tooling preamble·wrapper/decoy·partial copy·최소 gap·adversarial 성능 경계 | Node test 20개 통과 |
+| TypeScript | typecheck·build 통과 |
+| npm artifact | 8 files, 5.5 kB, source/test 제외 |
+| npm registry | `@mir-stream/openclaw-prompt-compat@0.1.0` public 게시, shasum `87cecc4885f1acc337216404dbe003f289092f25` |
+| OpenClaw package install | 게시된 exact `npm:` spec의 `--pin` managed install 성공 |
+| 정확한 host | OpenClaw `2026.7.1` (`2d2ddc4`) runtime load 성공 |
+| 게시본 plugin 활성 mock outbound | system=`within`, 같은 원문 user 메시지=`inside` |
+| plugin 비활성 mock outbound | system·user 모두=`inside`로 복원 |
+| Z.AI live Gateway turn | `zai/glm-5.2`, `status: ok`, 응답 `ZAI_COMPAT_OK` |
+| Z.AI provider-bound system | cache trace 첫 줄=`within` |
+| 비밀정보 비영속성 | 임시 config·state·session·trace·log에서 API key 원문 없음 |
 
-릴리스 전에 packed npm artifact로 아래 두 번의 실제 agent turn을 확인한다.
+mock outbound 검증은 실제 OpenClaw embedded runner가 OpenAI-compatible local endpoint로 보낸 payload를
+캡처했다. 이 검증으로 system 첫 줄이 바뀌면서 standalone user copy는 유지되는 것을 직접 확인했다.
 
-1. Z.AI 재현 요청이 `429/1305` 없이 성공한다.
-2. 다른 provider 하나에서 기존 응답과 tool call이 깨지지 않는다.
+Z.AI 검증은 별도 임시 `HOME`, `OPENCLAW_STATE_DIR`, `OPENCLAW_CONFIG_PATH`에서 foreground Gateway를
+기동해 수행했다. API key는 process environment에만 넣었고 onboarding, auth profile, config, `.env`에는
+기록하지 않았다. 검증 후 Gateway를 종료하고 환경변수를 해제했다.
 
-## 5. 롤백
+## 6. `setup_openclaw` 통합 계약
 
-문제가 생기면 이 플러그인만 끄고 gateway를 재시작한다.
+`mir-stream/rota-crew`의 `setup_openclaw`는 다음과 같이 맞춘다.
+
+- 기본 OpenClaw 버전과 도움말·배포 문서를 `2026.7.1`로 올린다.
+- OpenClaw `2026.7.1`의 Node engine 범위를 검사한다.
+- `--prompt-compat-version` 기본값을 `0.1.0`으로 둔다.
+- 미설치 상태에서만 exact npm package를 신규 설치한다.
+- 설치돼 있고 명시적으로 disabled이면 update·install·enable하지 않는다.
+- 설치돼 있고 enabled이면 exact pinned npm registry record로 수렴시킨다. 같은 manifest version이어도
+  local·npm-pack·unpinned record이면 `--force --pin`으로 교체하고, 이미 exact 상태일 때만 건너뛴다.
+- runtime inspect의 종료코드만 믿지 않고 `status=loaded`, `imported=true`와 active module
+  root가 managed install path인지 함께 확인한다. config-selected 동일 ID local copy가 shadowing하면
+  성공으로 처리하지 않는다.
+- setup은 검증 후 Gateway를 재시작한다. 실제 agent turn 검증은 릴리스 수용 테스트에서 별도로
+  수행한다.
+
+npm package가 게시되기 전에는 이 setup 변경을 공개 배포하지 않는다. 로컬 코드 통합과 shell 검증을
+먼저 끝내고, `0.1.0` 게시 후 package install acceptance를 다시 통과시킨 뒤 배포한다.
+
+## 7. 롤백
+
+운영 롤백은 독립 플러그인만 disable하고 Gateway를 재시작한다.
 
 ```sh
 openclaw plugins disable openclaw-prompt-compat
 openclaw gateway restart
 ```
 
-완전 제거는 `openclaw plugins uninstall openclaw-prompt-compat`으로 한다. 승인 플러그인과 코드·설정을
-공유하지 않으므로 롤백해도 `rota-approval-gate`에는 영향이 없다.
+완전 제거는 다음과 같다.
 
-## 6. 완료 조건
+```sh
+openclaw plugins uninstall openclaw-prompt-compat
+```
 
-- [ ] `mir-stream/openclaw-prompt-compat` 저장소가 생성된다.
-- [ ] 단위 테스트와 packed-package smoke가 통과한다.
-- [ ] `@rotacrew/openclaw-prompt-compat@0.1.0`이 npm에 게시된다.
-- [ ] npm 설치본으로 Z.AI와 다른 provider의 agent turn이 통과한다.
-- [ ] `setup_openclaw`가 exact npm version을 설치하고 재실행해도 수렴한다.
-- [ ] 플러그인 disable 후 원문이 복원되고 `rota-approval-gate`는 계속 동작한다.
+setup 재실행은 명시적 disable을 보존한다. 완전 제거 후 setup을 다시 실행하면 관리 대상이 없다고 판단해
+플러그인을 새로 설치하므로, 장기 opt-out은 uninstall이 아니라 disable로 표현한다.
+
+## 8. 완료 조건
+
+- [x] 독립 plugin source·manifest·build·CI가 구현됐다.
+- [x] 단위 테스트와 package dry-run이 통과했다.
+- [x] packed artifact가 OpenClaw `2026.7.1` managed npm 경로에서 설치·load됐다.
+- [x] 실제 outbound payload에서 system 첫 줄만 바뀌고 standalone user copy는 유지됐다.
+- [x] Z.AI Coding Plan live agent turn이 성공했다.
+- [x] `@mir-stream/openclaw-prompt-compat@0.1.0`을 npm에 게시한다.
+- [x] 게시된 npm artifact로 package acceptance를 다시 실행한다.
+- [ ] `setup_openclaw` 변경을 배포하고 새 설치·재실행·disable 보존을 확인한다.
+
+## 9. 검토 근거
+
+- [OpenClaw `v2026.7.1` system prompt 생성 코드](https://github.com/openclaw/openclaw/blob/v2026.7.1/src/agents/system-prompt.ts)
+- [`registerTextTransforms`와 재귀 message 변환](https://github.com/openclaw/openclaw/blob/v2026.7.1/src/agents/plugin-text-transforms.ts)
+- [provider system prompt transform](https://github.com/openclaw/openclaw/blob/v2026.7.1/src/plugins/provider-runtime.ts)
+- [외부 plugin package 작성 계약](https://github.com/openclaw/openclaw/blob/v2026.7.1/docs/plugins/building-plugins.md)
+- [Z.AI provider 설정](https://github.com/openclaw/openclaw/blob/v2026.7.1/docs/providers/zai.md)

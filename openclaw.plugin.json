@@ -1,0 +1,14 @@
+{
+  "id": "openclaw-prompt-compat",
+  "version": "0.1.0",
+  "name": "OpenClaw Prompt Compatibility",
+  "description": "Rewrites one fingerprinted OpenClaw system-prompt identity sentence for endpoint compatibility.",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

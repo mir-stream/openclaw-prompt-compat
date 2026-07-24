@@ -9,8 +9,39 @@ You are a personal assistant running inside OpenClaw.
 You are a personal assistant running within OpenClaw.
 ```
 
-The plugin is provider- and model-independent. It has no configuration and no
-runtime dependencies.
+The replacement sentence is configurable; the sentence and structure it matches
+are not. The plugin is provider- and model-independent and has no runtime
+dependencies.
+
+## Configuration
+
+`identitySentence` sets the sentence written in place of the matched identity:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "openclaw-prompt-compat": {
+        "config": {
+          "identitySentence": "You are an assistant that helps with office and administrative work."
+        }
+      }
+    }
+  }
+}
+```
+
+- Default: `You are a personal assistant running within OpenClaw.` An install
+  with no `config` behaves exactly as it did before this setting existed.
+- Maximum length: 2000 characters, after trimming surrounding whitespace.
+- Multiple lines are allowed. The prompt continues with `## Tooling` on its own
+  line, so extra lines do not disturb the surrounding structure.
+- A non-string, empty, whitespace-only, or over-long value logs a warning and
+  falls back to the default rather than silently doing nothing. A value that
+  repeats the original identity sentence is used as given, with a warning that
+  it defeats the rewrite.
+
+Restart the Gateway after changing the value.
 
 ## How it is scoped
 
@@ -40,7 +71,7 @@ immediately followed by `## Runtime`.
 
 ## Compatibility
 
-- Package: `@mir-stream/openclaw-prompt-compat@0.1.0`
+- Package: `@mir-stream/openclaw-prompt-compat@0.2.0`
 - Plugin id: `openclaw-prompt-compat`
 - OpenClaw host: `>=2026.7.1`
 - OpenClaw plugin API: `>=2026.7.1`
@@ -56,7 +87,7 @@ Install and pin the published version:
 
 ```sh
 openclaw plugins install \
-  "npm:@mir-stream/openclaw-prompt-compat@0.1.0" \
+  "npm:@mir-stream/openclaw-prompt-compat@0.2.0" \
   --pin
 ```
 
@@ -104,6 +135,11 @@ copies the exact identity, fixed 2026.7.1 Tooling preamble, and later structural
 markers can also match and have its first identity sentence changed. Strict
 system-prompt-only behavior requires a dedicated upstream OpenClaw transform
 surface.
+
+Because `identitySentence` is user-authored text, that text is what gets written
+wherever the fingerprint matches — not only in system prompts. Treat a
+configured sentence as content that may surface in any matching string, and keep
+it free of secrets.
 
 ## Development
 

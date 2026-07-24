@@ -5,12 +5,15 @@ import test from "node:test";
 
 import plugin, {
   COMPATIBLE_IDENTITY_SENTENCE,
+  DEFAULT_IDENTITY_SENTENCE,
+  MAX_IDENTITY_SENTENCE_LENGTH,
   OPENCLAW_SYSTEM_PROMPT_FINGERPRINT,
   ORIGINAL_IDENTITY_SENTENCE,
   PLUGIN_ID,
   TOOLING_SECTION_PREAMBLE,
   createPromptCompatTextTransforms,
   replaceOpenClawPromptIdentity,
+  resolveIdentitySentence,
 } from "../dist/index.js";
 
 const CACHE_BOUNDARY = "\n<!-- OPENCLAW_CACHE_BOUNDARY -->\n";
@@ -68,6 +71,13 @@ test("declares a host-compatible external package contract", async () => {
   assert.equal(packageJson.name, "@mir-stream/openclaw-prompt-compat");
   assert.equal(manifest.id, plugin.id);
   assert.equal(manifest.version, packageJson.version);
+  assert.equal(manifest.configSchema.additionalProperties, false);
+  assert.deepEqual(manifest.configSchema.properties.identitySentence.type, "string");
+  assert.equal(manifest.configSchema.properties.identitySentence.minLength, 1);
+  assert.equal(
+    manifest.configSchema.properties.identitySentence.maxLength,
+    MAX_IDENTITY_SENTENCE_LENGTH,
+  );
   assert.deepEqual(packageJson.openclaw.build, {
     openclawVersion: "2026.7.1",
     pluginSdkVersion: "2026.7.1",
@@ -348,4 +358,193 @@ test("documents the residual collision for a deliberately copied full fingerprin
 
   assert.notEqual(output, copiedUserContent);
   assert.equal(output.includes(COMPATIBLE_IDENTITY_SENTENCE), true);
+});
+
+function fakeLogger() {
+  const warnings = [];
+  return {
+    warnings,
+    warn(message) {
+      warnings.push(message);
+    },
+  };
+}
+
+function register(api) {
+  const registrations = [];
+  plugin.register({
+    registerTextTransforms(registration) {
+      registrations.push(registration);
+    },
+    ...api,
+  });
+
+  assert.equal(registrations.length, 1);
+  return registrations[0];
+}
+
+/** Replaces without letting the test itself hit `$` replacement sequences. */
+function expectedRewrite(input, identity) {
+  return input.replace(ORIGINAL_IDENTITY_SENTENCE, () => identity);
+}
+
+test("keeps the pre-configuration default sentence and export alias", () => {
+  assert.equal(DEFAULT_IDENTITY_SENTENCE, "You are a personal assistant running within OpenClaw.");
+  assert.equal(COMPATIBLE_IDENTITY_SENTENCE, DEFAULT_IDENTITY_SENTENCE);
+  assert.equal(MAX_IDENTITY_SENTENCE_LENGTH, 2000);
+});
+
+test("uses the default sentence when no identitySentence is configured", () => {
+  const logger = fakeLogger();
+  const apis = [
+    {},
+    { pluginConfig: undefined, logger },
+    { pluginConfig: {}, logger },
+    { pluginConfig: { identitySentence: undefined }, logger },
+  ];
+
+  for (const api of apis) {
+    const registration = register(api);
+
+    assert.equal(
+      applyRegistration(fullPrompt(), registration),
+      expectedRewrite(fullPrompt(), DEFAULT_IDENTITY_SENTENCE),
+    );
+  }
+
+  assert.deepEqual(logger.warnings, []);
+});
+
+test("rewrites full and minimal prompts with a configured sentence", () => {
+  const identitySentence = "You are an assistant that helps with office and administrative work.";
+  const logger = fakeLogger();
+  const registration = register({ pluginConfig: { identitySentence }, logger });
+
+  for (const input of [fullPrompt(), minimalPrompt()]) {
+    const output = applyRegistration(input, registration);
+
+    assert.equal(output, expectedRewrite(input, identitySentence));
+    assert.equal(output.startsWith(identitySentence), true);
+  }
+
+  assert.deepEqual(logger.warnings, []);
+  assert.equal(
+    replaceOpenClawPromptIdentity(fullPrompt(), identitySentence),
+    expectedRewrite(fullPrompt(), identitySentence),
+  );
+});
+
+test("inserts a configured sentence containing $ sequences literally", () => {
+  const identitySentence =
+    "You are an office assistant. Budget: $1 and $& and $' and $` and $$.";
+  const registration = register({ pluginConfig: { identitySentence } });
+  const input = fullPrompt();
+
+  for (const output of [
+    applyRegistration(input, registration),
+    replaceOpenClawPromptIdentity(input, identitySentence),
+  ]) {
+    assert.equal(output.startsWith(identitySentence), true);
+    assert.equal(output, expectedRewrite(input, identitySentence));
+    assert.equal(output.includes(ORIGINAL_IDENTITY_SENTENCE), false);
+    assert.equal(output.split(TOOLING_SECTION_PREAMBLE).length - 1, 1);
+    assert.equal(output.split("## Runtime").length - 1, 1);
+    assert.equal(output.split(CACHE_BOUNDARY).length - 1, 1);
+  }
+});
+
+test("allows a multi-line configured sentence and keeps the Tooling section intact", () => {
+  const identitySentence = "You are an office assistant.\nYou draft and file documents.";
+  const registration = register({ pluginConfig: { identitySentence } });
+  const output = applyRegistration(fullPrompt(), registration);
+
+  assert.equal(output.startsWith(`${identitySentence}\n## Tooling\n`), true);
+  assert.equal(output.includes(`\n## Tooling\n${TOOLING_SECTION_PREAMBLE}\n`), true);
+});
+
+test("warns and falls back for invalid identitySentence values", () => {
+  const invalidValues = [
+    42,
+    true,
+    null,
+    { sentence: "no" },
+    ["no"],
+    "",
+    "   \n\t ",
+    "x".repeat(MAX_IDENTITY_SENTENCE_LENGTH + 1),
+  ];
+
+  for (const identitySentence of invalidValues) {
+    const logger = fakeLogger();
+    const registration = register({ pluginConfig: { identitySentence }, logger });
+
+    assert.equal(
+      applyRegistration(fullPrompt(), registration),
+      expectedRewrite(fullPrompt(), DEFAULT_IDENTITY_SENTENCE),
+    );
+    assert.equal(logger.warnings.length, 1);
+    assert.equal(logger.warnings[0].includes("identitySentence"), true);
+    assert.equal(logger.warnings[0].includes(PLUGIN_ID), true);
+  }
+});
+
+test("resolves a trimmed sentence and tolerates a missing logger", () => {
+  assert.equal(
+    resolveIdentitySentence({ identitySentence: "  You are an office assistant.  " }),
+    "You are an office assistant.",
+  );
+  assert.equal(resolveIdentitySentence(undefined), DEFAULT_IDENTITY_SENTENCE);
+  assert.equal(resolveIdentitySentence("not an object"), DEFAULT_IDENTITY_SENTENCE);
+  assert.equal(resolveIdentitySentence({ identitySentence: 42 }), DEFAULT_IDENTITY_SENTENCE);
+  assert.equal(
+    resolveIdentitySentence({ identitySentence: "x".repeat(MAX_IDENTITY_SENTENCE_LENGTH) }),
+    "x".repeat(MAX_IDENTITY_SENTENCE_LENGTH),
+  );
+});
+
+test("warns but keeps a configured sentence that repeats the original identity", () => {
+  const identitySentence = `${ORIGINAL_IDENTITY_SENTENCE} You also handle office work.`;
+  const logger = fakeLogger();
+  const registration = register({ pluginConfig: { identitySentence }, logger });
+
+  assert.equal(resolveIdentitySentence({ identitySentence }, logger), identitySentence);
+  assert.equal(
+    applyRegistration(fullPrompt(), registration).startsWith(identitySentence),
+    true,
+  );
+  assert.equal(logger.warnings.length, 2);
+  for (const warning of logger.warnings) {
+    assert.equal(warning.includes("identitySentence"), true);
+  }
+});
+
+test("keeps the fingerprint scope unchanged for a configured sentence", () => {
+  const identitySentence = "You are an office assistant.";
+  const registration = register({ pluginConfig: { identitySentence } });
+  const unchangedInputs = [
+    `Arbitrary role-less text.\n${fullPrompt()}`,
+    `Inline copy: ${fullPrompt()}`,
+    ORIGINAL_IDENTITY_SENTENCE,
+    [
+      "---",
+      "",
+      "OpenClaw plugin-injected system context. This block is not workspace file content.",
+      "",
+      ORIGINAL_IDENTITY_SENTENCE,
+      "## Tooling",
+      TOOLING_SECTION_PREAMBLE,
+      "This is still quoted plugin context.",
+      "",
+      "---",
+      "",
+      fullPrompt(),
+    ].join("\n"),
+    `${ORIGINAL_IDENTITY_SENTENCE}\n## Tooling\n${TOOLING_SECTION_PREAMBLE}\n## Workspace Files (injected)\n## Runtime\n`,
+    fullPrompt().replace("\n## Tooling\n", "\n## tooling\n"),
+  ];
+
+  for (const input of unchangedInputs) {
+    assert.equal(applyRegistration(input, registration), input);
+    assert.equal(replaceOpenClawPromptIdentity(input, identitySentence), input);
+  }
 });

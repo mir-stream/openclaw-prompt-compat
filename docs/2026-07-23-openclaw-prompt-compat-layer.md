@@ -41,6 +41,17 @@ You are a personal assistant running within OpenClaw.
 provider payload 전체나 user prompt를 수정하지 않고, OpenClaw system prompt의 해당 identity span만
 치환한다.
 
+`0.2.0`부터 교체 문장은 `plugins.entries.openclaw-prompt-compat.config.identitySentence`로 설정한다.
+설정 가능한 것은 "무엇으로 바꾸는가"뿐이고 지문은 그대로 고정이므로, 사용자 설정이 match 범위를
+넓힐 수 없다. 설정이 없으면 기본값은 위의 `within` 문장 그대로이고 `0.1.0`과 동작이 같다. 값이
+문자열이 아니거나 비었거나 2000자를 넘으면 경고를 남기고 기본값으로 폴백한다. 조용한 no-op은
+이 플러그인에서 가장 진단하기 어려운 실패 모드이므로 모든 폴백에 경고를 남긴다.
+
+설정값은 `to`에 넣기 전에 `$`를 `$$`로 이스케이프한다. `String.prototype.replace`의 replacement
+문자열은 `$$`, `$&`, `` $` ``, `$'`, `$1`~`$9`를 치환 시퀀스로 해석하고 지문에는 capture group이
+3개 있다. 이스케이프가 없으면 `$`가 든 설정 문장이 prompt 본문 구간을 그대로 주입한다. 등록
+경로와 `replaceOpenClawPromptIdentity`가 같은 이스케이프 함수를 공유한다.
+
 ## 2. 식별 지문과 구현
 
 플러그인은 `registerTextTransforms`에 input replacement 하나만 등록한다.
@@ -124,10 +135,11 @@ README.md
 LICENSE
 ```
 
-- manifest는 `activation.onStartup: true`와 빈 strict config schema를 선언한다.
+- manifest는 `activation.onStartup: true`와 strict config schema를 선언한다. schema는
+  `identitySentence` 하나만 허용하고 `additionalProperties: false`를 유지한다.
 - `package.json#openclaw.extensions`는 build된 `./dist/index.js`를 가리킨다.
 - `openclaw.compat.pluginApi`와 `openclaw.build.openclawVersion`은 `2026.7.1` 계약을 명시한다.
-- runtime dependency와 사용자 설정은 없다.
+- runtime dependency는 없다. 사용자 설정은 `identitySentence` 하나이고 선택 사항이다.
 - 플러그인을 끄려면 plugin 자체를 disable한다.
 
 게시 전 검증 명령은 다음과 같다.

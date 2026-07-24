@@ -1,14 +1,21 @@
 {
   "id": "openclaw-prompt-compat",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "name": "OpenClaw Prompt Compatibility",
-  "description": "Rewrites one fingerprinted OpenClaw system-prompt identity sentence for endpoint compatibility.",
+  "description": "Rewrites the fingerprinted OpenClaw system-prompt identity sentence with a configurable sentence.",
   "activation": {
     "onStartup": true
   },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
-    "properties": {}
+    "properties": {
+      "identitySentence": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 2000,
+        "description": "Sentence that replaces the fingerprinted OpenClaw identity sentence. Defaults to \"You are a personal assistant running within OpenClaw.\" when unset. Invalid values fall back to that default with a warning."
+      }
+    }
   }
 }

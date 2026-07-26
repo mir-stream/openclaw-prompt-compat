@@ -15,7 +15,53 @@ dependencies.
 
 ## Configuration
 
-`identitySentence` sets the sentence written in place of the matched identity:
+The plugin exposes one setting, `identitySentence`: the sentence written in
+place of the matched OpenClaw identity. The plugin makes no assumptions about
+the role — use any sentence that fits your deployment.
+
+Config path:
+
+```text
+plugins.entries.openclaw-prompt-compat.config.identitySentence
+```
+
+### Set it non-interactively
+
+Install `0.2.0` (or later) first — the setting is rejected by the strict config
+schema until the version that declares it is installed. Then write the value and
+restart the Gateway:
+
+```sh
+openclaw config set \
+  "plugins.entries.openclaw-prompt-compat.config.identitySentence" \
+  "You are the assistant for the Acme support desk."
+
+openclaw gateway restart
+```
+
+The example sentence is illustrative only; substitute your own.
+
+In a setup script, prefer batch mode — unlike value mode, it validates the
+write against the schema, so an unknown key or an uninstalled version fails
+loudly instead of writing silently:
+
+```sh
+openclaw config set --batch-file ./identity.batch.json
+```
+
+```json
+[
+  {
+    "path": "plugins.entries.openclaw-prompt-compat.config.identitySentence",
+    "value": "You are the assistant for the Acme support desk."
+  }
+]
+```
+
+Confirm the stored value with
+`openclaw config get "plugins.entries.openclaw-prompt-compat.config.identitySentence"`.
+
+### Equivalent config-file form
 
 ```json
 {
@@ -23,13 +69,15 @@ dependencies.
     "entries": {
       "openclaw-prompt-compat": {
         "config": {
-          "identitySentence": "You are an assistant that helps with office and administrative work."
+          "identitySentence": "You are the assistant for the Acme support desk."
         }
       }
     }
   }
 }
 ```
+
+### Behavior
 
 - Default: `You are a personal assistant running within OpenClaw.` An install
   with no `config` behaves exactly as it did before this setting existed.
@@ -40,8 +88,8 @@ dependencies.
   falls back to the default rather than silently doing nothing. A value that
   repeats the original identity sentence is used as given, with a warning that
   it defeats the rewrite.
-
-Restart the Gateway after changing the value.
+- Changing the value takes effect only after a Gateway restart — the rewrite is
+  registered once at plugin startup.
 
 ## How it is scoped
 

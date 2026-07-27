@@ -10,7 +10,6 @@ import plugin, {
   OPENCLAW_SYSTEM_PROMPT_FINGERPRINT,
   ORIGINAL_IDENTITY_SENTENCE,
   PLUGIN_ID,
-  TOOLING_SECTION_PREAMBLE,
   createPromptCompatTextTransforms,
   replaceOpenClawPromptIdentity,
   resolveIdentitySentence,
@@ -18,15 +17,37 @@ import plugin, {
 
 const CACHE_BOUNDARY = "\n<!-- OPENCLAW_CACHE_BOUNDARY -->\n";
 
-function fullPrompt(identity = ORIGINAL_IDENTITY_SENTENCE) {
+/**
+ * OpenClaw rewrote its system-prompt prose in 2026.7.2. None of that prose is
+ * part of the fingerprint any more, so both wordings live here as fixture
+ * literals and every positive case is run against both shapes.
+ */
+const PROMPT_SHAPES = [
+  {
+    version: "2026.7.1",
+    toolingPreamble:
+      "Available tools are policy-filtered. Names are case-sensitive; call exactly as listed.",
+    workspaceLine: "Your working directory is: /workspace",
+  },
+  {
+    version: "2026.7.2-beta",
+    toolingPreamble: "Tools policy-filtered. Names case-sensitive; call exact.",
+    workspaceLine: "Working directory: /workspace",
+  },
+];
+
+const [SHAPE_2026_7_1] = PROMPT_SHAPES;
+const TOOLING_PREAMBLE = SHAPE_2026_7_1.toolingPreamble;
+
+function fullPrompt(identity = ORIGINAL_IDENTITY_SENTENCE, shape = SHAPE_2026_7_1) {
   return [
     identity,
     "## Tooling",
-    TOOLING_SECTION_PREAMBLE,
+    shape.toolingPreamble,
     "## Safety",
     "No independent goals.",
     "## Workspace",
-    "Your working directory is: /workspace",
+    shape.workspaceLine,
     "## Workspace Files (injected)",
     "These user-editable files are loaded by OpenClaw.",
   ].join("\n") + CACHE_BOUNDARY + [
@@ -37,14 +58,16 @@ function fullPrompt(identity = ORIGINAL_IDENTITY_SENTENCE) {
   ].join("\n");
 }
 
-function minimalPrompt(identity = ORIGINAL_IDENTITY_SENTENCE) {
+function minimalPrompt(identity = ORIGINAL_IDENTITY_SENTENCE, shape = SHAPE_2026_7_1) {
   return [
     identity,
     "## Tooling",
-    TOOLING_SECTION_PREAMBLE,
+    shape.toolingPreamble,
     "- read: Read file contents",
+    "## Safety",
+    "No independent goals.",
     "## Workspace",
-    "Your working directory is: /workspace",
+    shape.workspaceLine,
     "## Workspace Files (injected)",
     "These user-editable files are loaded by OpenClaw.",
   ].join("\n") + CACHE_BOUNDARY + [
@@ -69,6 +92,7 @@ test("declares a host-compatible external package contract", async () => {
   ]);
 
   assert.equal(packageJson.name, "@mir-stream/openclaw-prompt-compat");
+  assert.equal(packageJson.version, "0.3.0");
   assert.equal(manifest.id, plugin.id);
   assert.equal(manifest.version, packageJson.version);
   assert.equal(manifest.configSchema.additionalProperties, false);
@@ -84,6 +108,8 @@ test("declares a host-compatible external package contract", async () => {
   });
   assert.deepEqual(packageJson.openclaw.extensions, ["./dist/index.js"]);
   assert.equal(packageJson.openclaw.compat.pluginApi, ">=2026.7.1");
+  assert.equal(packageJson.openclaw.install.minHostVersion, ">=2026.7.1");
+  assert.equal(packageJson.peerDependencies.openclaw, ">=2026.7.1");
   assert.equal(
     packageJson.engines.node,
     ">=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0",
@@ -91,25 +117,24 @@ test("declares a host-compatible external package contract", async () => {
   assert.equal(packageJson.dependencies, undefined);
 });
 
-test("rewrites a full OpenClaw system-prompt fingerprint", () => {
-  const input = fullPrompt();
-  const output = replaceOpenClawPromptIdentity(input);
-
-  assert.equal(output, input.replace(ORIGINAL_IDENTITY_SENTENCE, COMPATIBLE_IDENTITY_SENTENCE));
-});
-
-test("rewrites a minimal OpenClaw system-prompt fingerprint", () => {
-  const input = minimalPrompt();
-  const output = replaceOpenClawPromptIdentity(input);
-
-  assert.equal(output, input.replace(ORIGINAL_IDENTITY_SENTENCE, COMPATIBLE_IDENTITY_SENTENCE));
+test("rewrites full and minimal prompts across prose rewrites", () => {
+  for (const shape of PROMPT_SHAPES) {
+    for (const input of [fullPrompt(undefined, shape), minimalPrompt(undefined, shape)]) {
+      assert.equal(
+        replaceOpenClawPromptIdentity(input),
+        input.replace(ORIGINAL_IDENTITY_SENTENCE, COMPATIBLE_IDENTITY_SENTENCE),
+        `${shape.version} prompt shape must still match`,
+      );
+    }
+  }
 });
 
 test("allows empty gaps between required prompt markers", () => {
   const input = [
     ORIGINAL_IDENTITY_SENTENCE,
     "## Tooling",
-    TOOLING_SECTION_PREAMBLE,
+    "## Safety",
+    "## Workspace",
     "## Workspace Files (injected)",
     "<!-- OPENCLAW_CACHE_BOUNDARY -->",
     "## Runtime",
@@ -168,7 +193,8 @@ test("does not let an exact scaffold inside wrapped plugin context become the ro
     "",
     ORIGINAL_IDENTITY_SENTENCE,
     "## Tooling",
-    TOOLING_SECTION_PREAMBLE,
+    "## Safety",
+    "## Workspace",
     "This is still quoted plugin context.",
     "",
     "---",
@@ -191,8 +217,8 @@ test("ignores an identity and Tooling copy inside the real Tooling section", () 
     "This is quoted tool documentation, not a prompt root.",
   ].join("\n");
   const input = fullPrompt().replace(
-    `${TOOLING_SECTION_PREAMBLE}\n`,
-    `${TOOLING_SECTION_PREAMBLE}\n${quotedCopy}\n`,
+    `${TOOLING_PREAMBLE}\n`,
+    `${TOOLING_PREAMBLE}\n${quotedCopy}\n`,
   );
   const output = replaceOpenClawPromptIdentity(input);
 
@@ -237,14 +263,70 @@ test("does not rewrite the identity sentence in the middle of a line", () => {
 
 test("rejects partial and incorrectly ordered fingerprints", () => {
   const partialAndWrongOrder = [
-    `${ORIGINAL_IDENTITY_SENTENCE}\n## Tooling\n${TOOLING_SECTION_PREAMBLE}\n## Workspace Files (injected)\n## Runtime\n`,
-    `${ORIGINAL_IDENTITY_SENTENCE}\n## Tooling\n${TOOLING_SECTION_PREAMBLE}\n${CACHE_BOUNDARY}## Runtime\n`,
-    `${ORIGINAL_IDENTITY_SENTENCE}\n## Tooling\n${TOOLING_SECTION_PREAMBLE}\n## Workspace Files (injected)\n## Runtime\n${CACHE_BOUNDARY}`,
-    `${ORIGINAL_IDENTITY_SENTENCE}\n## Tooling\n${TOOLING_SECTION_PREAMBLE}\n${CACHE_BOUNDARY}## Workspace Files (injected)\n## Runtime\n`,
+    `${ORIGINAL_IDENTITY_SENTENCE}\n## Tooling\n## Safety\n## Workspace\n## Workspace Files (injected)\n## Runtime\n`,
+    `${ORIGINAL_IDENTITY_SENTENCE}\n## Tooling\n## Safety\n## Workspace\n${CACHE_BOUNDARY}## Runtime\n`,
+    `${ORIGINAL_IDENTITY_SENTENCE}\n## Tooling\n## Safety\n## Workspace\n## Workspace Files (injected)\n## Runtime\n${CACHE_BOUNDARY}`,
+    `${ORIGINAL_IDENTITY_SENTENCE}\n## Tooling\n## Safety\n## Workspace\n${CACHE_BOUNDARY}## Workspace Files (injected)\n## Runtime\n`,
     `${ORIGINAL_IDENTITY_SENTENCE}\n## Workspace Files (injected)\n## Tooling\n${CACHE_BOUNDARY}## Runtime\n`,
   ];
 
   for (const input of partialAndWrongOrder) {
+    assert.equal(replaceOpenClawPromptIdentity(input), input);
+  }
+});
+
+test("rejects a prompt without the Safety section", () => {
+  const input = fullPrompt().replace("## Safety\nNo independent goals.\n", "");
+
+  assert.equal(input.includes("## Safety"), false);
+  assert.equal(replaceOpenClawPromptIdentity(input), input);
+});
+
+test("does not let Workspace Files stand in for the Workspace heading", () => {
+  const input = [
+    ORIGINAL_IDENTITY_SENTENCE,
+    "## Tooling",
+    TOOLING_PREAMBLE,
+    "## Safety",
+    "No independent goals.",
+    "## Workspace Files (injected)",
+    "These user-editable files are loaded by OpenClaw.",
+  ].join("\n") + CACHE_BOUNDARY + "## Runtime\nRuntime: agent=main | model=openai/gpt-5";
+
+  assert.equal(input.includes("## Workspace Files (injected)"), true);
+  assert.equal(replaceOpenClawPromptIdentity(input), input);
+});
+
+test("rejects Safety and Workspace in the wrong order", () => {
+  const input = fullPrompt().replace(
+    "## Safety\nNo independent goals.\n## Workspace\n",
+    `## Workspace\n${SHAPE_2026_7_1.workspaceLine}\n## Safety\nNo independent goals.\n`,
+  );
+
+  assert.equal(input.indexOf("## Workspace\n") < input.indexOf("## Safety\n"), true);
+  assert.equal(replaceOpenClawPromptIdentity(input), input);
+});
+
+test("rejects changed case in the Safety and Workspace headings", () => {
+  const variants = [
+    fullPrompt().replace("\n## Safety\n", "\n## safety\n"),
+    fullPrompt().replace("\n## Safety\n", "\n## SAFETY\n"),
+    fullPrompt().replace("\n## Workspace\n", "\n## workspace\n"),
+    fullPrompt().replace("\n## Workspace\n", "\n## WorkSpace\n"),
+  ];
+
+  for (const input of variants) {
+    assert.equal(replaceOpenClawPromptIdentity(input), input);
+  }
+});
+
+test("rejects Safety and Workspace headings placed mid-line", () => {
+  const variants = [
+    fullPrompt().replace("\n## Safety\n", "\nQuoted: ## Safety\n"),
+    fullPrompt().replace("\n## Workspace\n", "\nQuoted: ## Workspace\n"),
+  ];
+
+  for (const input of variants) {
     assert.equal(replaceOpenClawPromptIdentity(input), input);
   }
 });
@@ -273,10 +355,9 @@ test("requires exact identity, marker case, and whitespace", () => {
     ),
     fullPrompt().replace("\n## Tooling\n", "\n## tooling\n"),
     fullPrompt().replace("\n## Tooling\n", "\r\n## Tooling\r\n"),
-    fullPrompt().replace(
-      TOOLING_SECTION_PREAMBLE,
-      "Available tools are policy filtered. Names are case-sensitive; call exactly as listed.",
-    ),
+    fullPrompt().replace("\n## Safety\n", "\n## Safety \n"),
+    fullPrompt().replace("\n## Safety\n", "\r\n## Safety\r\n"),
+    fullPrompt().replace("\n## Workspace\n", "\n##  Workspace\n"),
     fullPrompt().replace(
       "\n## Workspace Files (injected)\n",
       "\n## Workspace Files (Injected)\n",
@@ -305,7 +386,7 @@ test("uses a non-global stateless regex and changes at most one identity", () =>
 
 test("rejects repeated near-matches without quadratic rescanning", () => {
   const input =
-    `${ORIGINAL_IDENTITY_SENTENCE}\n## Tooling\n${TOOLING_SECTION_PREAMBLE}\n`.repeat(12_000);
+    `${ORIGINAL_IDENTITY_SENTENCE}\n## Tooling\n## Safety\n## Workspace\n`.repeat(12_000);
   const startedAt = performance.now();
 
   assert.equal(replaceOpenClawPromptIdentity(input), input);
@@ -323,14 +404,35 @@ test("rejects repeated marker chains without combinatorial backtracking", () => 
     "<!-- OPENCLAW_CACHE_BOUNDARY -->",
     "",
   ].join("\n").repeat(1_000);
-  const input =
-    `${ORIGINAL_IDENTITY_SENTENCE}\n## Tooling\n${TOOLING_SECTION_PREAMBLE}\n${repeatedMarkers}`;
+  const input = `${ORIGINAL_IDENTITY_SENTENCE}\n## Tooling\n## Safety\n## Workspace\n${repeatedMarkers}`;
   const startedAt = performance.now();
 
   assert.equal(replaceOpenClawPromptIdentity(input), input);
   assert.ok(
     performance.now() - startedAt < 500,
     "adversarial marker-chain scan exceeded 500 ms",
+  );
+});
+
+test("rejects repeated chains of every anchor without combinatorial backtracking", () => {
+  const repeatedMarkers = [
+    "",
+    "## Safety",
+    "No independent goals.",
+    "## Workspace",
+    "Working directory: /workspace",
+    "## Workspace Files (injected)",
+    "Injected content.",
+    "<!-- OPENCLAW_CACHE_BOUNDARY -->",
+    "",
+  ].join("\n").repeat(1_000);
+  const input = `${ORIGINAL_IDENTITY_SENTENCE}\n## Tooling\n${repeatedMarkers}`;
+  const startedAt = performance.now();
+
+  assert.equal(replaceOpenClawPromptIdentity(input), input);
+  assert.ok(
+    performance.now() - startedAt < 500,
+    "adversarial full-anchor chain scan exceeded 500 ms",
   );
 });
 
@@ -420,11 +522,13 @@ test("rewrites full and minimal prompts with a configured sentence", () => {
   const logger = fakeLogger();
   const registration = register({ pluginConfig: { identitySentence }, logger });
 
-  for (const input of [fullPrompt(), minimalPrompt()]) {
-    const output = applyRegistration(input, registration);
+  for (const shape of PROMPT_SHAPES) {
+    for (const input of [fullPrompt(undefined, shape), minimalPrompt(undefined, shape)]) {
+      const output = applyRegistration(input, registration);
 
-    assert.equal(output, expectedRewrite(input, identitySentence));
-    assert.equal(output.startsWith(identitySentence), true);
+      assert.equal(output, expectedRewrite(input, identitySentence));
+      assert.equal(output.startsWith(identitySentence), true);
+    }
   }
 
   assert.deepEqual(logger.warnings, []);
@@ -447,7 +551,9 @@ test("inserts a configured sentence containing $ sequences literally", () => {
     assert.equal(output.startsWith(identitySentence), true);
     assert.equal(output, expectedRewrite(input, identitySentence));
     assert.equal(output.includes(ORIGINAL_IDENTITY_SENTENCE), false);
-    assert.equal(output.split(TOOLING_SECTION_PREAMBLE).length - 1, 1);
+    assert.equal(output.split("\n## Safety\n").length - 1, 1);
+    assert.equal(output.split("\n## Workspace\n").length - 1, 1);
+    assert.equal(output.split("\n## Workspace Files (injected)\n").length - 1, 1);
     assert.equal(output.split("## Runtime").length - 1, 1);
     assert.equal(output.split(CACHE_BOUNDARY).length - 1, 1);
   }
@@ -459,7 +565,7 @@ test("allows a multi-line configured sentence and keeps the Tooling section inta
   const output = applyRegistration(fullPrompt(), registration);
 
   assert.equal(output.startsWith(`${identitySentence}\n## Tooling\n`), true);
-  assert.equal(output.includes(`\n## Tooling\n${TOOLING_SECTION_PREAMBLE}\n`), true);
+  assert.equal(output.includes(`\n## Tooling\n${TOOLING_PREAMBLE}\n`), true);
 });
 
 test("warns and falls back for invalid identitySentence values", () => {
@@ -532,15 +638,17 @@ test("keeps the fingerprint scope unchanged for a configured sentence", () => {
       "",
       ORIGINAL_IDENTITY_SENTENCE,
       "## Tooling",
-      TOOLING_SECTION_PREAMBLE,
+      "## Safety",
+      "## Workspace",
       "This is still quoted plugin context.",
       "",
       "---",
       "",
       fullPrompt(),
     ].join("\n"),
-    `${ORIGINAL_IDENTITY_SENTENCE}\n## Tooling\n${TOOLING_SECTION_PREAMBLE}\n## Workspace Files (injected)\n## Runtime\n`,
+    `${ORIGINAL_IDENTITY_SENTENCE}\n## Tooling\n## Safety\n## Workspace\n## Workspace Files (injected)\n## Runtime\n`,
     fullPrompt().replace("\n## Tooling\n", "\n## tooling\n"),
+    fullPrompt().replace("\n## Safety\n", "\n## safety\n"),
   ];
 
   for (const input of unchangedInputs) {

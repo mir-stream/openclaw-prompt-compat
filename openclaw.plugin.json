@@ -1,6 +1,6 @@
 {
   "id": "openclaw-prompt-compat",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "name": "OpenClaw Prompt Compatibility",
   "description": "Rewrites the fingerprinted OpenClaw system-prompt identity sentence with a configurable sentence.",
   "activation": {

@@ -5,11 +5,14 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import ts from "typescript";
 
 import {
   CheckError,
   checkAnchorLiterals,
   checkRenderedFingerprint,
+  classifyFingerprintFindings,
+  findBuilderExports,
   findBuilderFiles,
   inspectTargets,
   renderHumanReport,
@@ -209,6 +212,40 @@ test("does not let Workspace Files satisfy the Workspace anchor", () => {
   );
 });
 
+function parseJavaScript(source) {
+  return ts.createSourceFile(
+    "fixture.mjs",
+    source,
+    ts.ScriptTarget.Latest,
+    false,
+    ts.ScriptKind.JS,
+  );
+}
+
+test("ignores prompt-builder export text in comments and strings", () => {
+  const sourceFile = parseJavaScript(`
+// export { buildCommentAgentSystemPrompt };
+const decoy = "export { buildStringAgentSystemPrompt as builder }";
+/* export { buildBlockAgentSystemPrompt } */
+`);
+  assert.deepEqual(findBuilderExports(sourceFile), []);
+});
+
+test("finds legitimate bare and aliased prompt-builder exports", () => {
+  const sourceFile = parseJavaScript(`
+const buildBareAgentSystemPrompt = () => "";
+const buildAliasedAgentSystemPrompt = () => "";
+export {
+  buildBareAgentSystemPrompt,
+  buildAliasedAgentSystemPrompt as publicBuilder,
+};
+`);
+  assert.deepEqual(findBuilderExports(sourceFile), [
+    { alias: "buildBareAgentSystemPrompt", original: "buildBareAgentSystemPrompt" },
+    { alias: "publicBuilder", original: "buildAliasedAgentSystemPrompt" },
+  ]);
+});
+
 test("reserves CheckError for a package without enough builder evidence", () => {
   const root = mkdtempSync(path.join(tmpdir(), "fingerprint-watch-test-"));
   try {
@@ -238,6 +275,72 @@ test("reports render-not-run results as partial in human and Markdown output", (
   assert.match(markdown, /Layer A passed \(partial\)/);
   assert.match(markdown, /Coverage is partial; the full fingerprint was not verified/);
   assert.match(markdown, /install unavailable/);
+});
+
+function missingIdentityLiteralCheck() {
+  return {
+    ran: true,
+    found: ANCHORS.filter((anchor) => anchor.id !== "identity"),
+    missing: [{ id: "identity", literal: "You are OpenClaw.", nearest: [] }],
+  };
+}
+
+function renderCheck(defaultMatched, minimalMatched) {
+  return {
+    ran: true,
+    builderExport: "buildAgentSystemPrompt",
+    modes: {
+      default: { matched: defaultMatched, firstLine: "You are OpenClaw.", headings: [] },
+      minimal: { matched: minimalMatched, firstLine: "You are OpenClaw.", headings: [] },
+    },
+  };
+}
+
+test("treats a missing source literal as diagnostic when both real renders match", () => {
+  const literalCheck = missingIdentityLiteralCheck();
+  const checkedRender = renderCheck(true, true);
+  assert.deepEqual(classifyFingerprintFindings(literalCheck, checkedRender), {
+    driftReasons: [],
+    sourceLayoutDiagnostics: ["identity"],
+  });
+
+  const result = {
+    version: "2026.7.2",
+    tags: ["latest"],
+    builderFiles: ["dist/system-prompt.js"],
+    literalCheck,
+    renderCheck: checkedRender,
+    drift: false,
+    driftReasons: [],
+    sourceLayoutDiagnostics: ["identity"],
+  };
+  const human = renderHumanReport([result]);
+  const markdown = renderMarkdownReport([result]);
+  assert.match(human, /PASS \(SOURCE-LAYOUT DIAGNOSTIC\)/);
+  assert.match(human, /LAYOUT\s+identity/);
+  assert.doesNotMatch(human, /both layers passed/i);
+  assert.match(markdown, /real-render fingerprint passed \(source-layout diagnostic\)/);
+  assert.match(markdown, /not runtime drift/);
+  assert.doesNotMatch(markdown, /anchor literals and real rendered prompt both passed/);
+});
+
+test("keeps a missing source literal as drift when real rendering is unavailable", () => {
+  const classified = classifyFingerprintFindings(missingIdentityLiteralCheck(), {
+    ran: false,
+    reason: "render unavailable",
+  });
+  assert.equal(classified.sourceLayoutDiagnostics.length, 0);
+  assert.match(classified.driftReasons.join("\n"), /identity.*not present as a string literal/);
+});
+
+test("keeps a missing source literal as drift when one real render mismatches", () => {
+  const classified = classifyFingerprintFindings(
+    missingIdentityLiteralCheck(),
+    renderCheck(true, false),
+  );
+  assert.equal(classified.sourceLayoutDiagnostics.length, 0);
+  assert.match(classified.driftReasons.join("\n"), /identity.*not present as a string literal/);
+  assert.match(classified.driftReasons.join("\n"), /real minimal render/);
 });
 
 test("turns npm install spawn failures into a render-not-run result", () => {
@@ -486,7 +589,15 @@ function loadPublisherScript() {
   return scriptLines.join("\n");
 }
 
-test("embedded publisher keeps a hostile render reason inert in created Markdown", async () => {
+test("artifact upload overwrites the stable report name on job reruns", () => {
+  const workflow = readFileSync(".github/workflows/upstream-watch.yml", "utf8");
+  assert.match(
+    workflow,
+    /uses: actions\/upload-artifact@v4[\s\S]*?name: fingerprint-report[\s\S]*?overwrite: true/,
+  );
+});
+
+test("embedded publisher accepts render-confirmed source-layout diagnostics and sanitizes drift", async () => {
   const publisherScript = loadPublisherScript();
 
   const anchorIds = [
@@ -501,10 +612,14 @@ test("embedded publisher keeps a hostile render reason inert in created Markdown
   const hostileReason =
     "[click](https://evil.example) @octocat **bold** <b>html</b> `tick` " +
     "<!-- evil-marker --> \u202E\u2066hidden";
-  const versionEntry = (version, tags, { missingIdentity = false, reason }) => ({
+  const versionEntry = (
     version,
     tags,
-    drift: missingIdentity,
+    { missingIdentity = false, reason, renderModes },
+  ) => ({
+    version,
+    tags,
+    drift: missingIdentity && !renderModes,
     literalCheck: {
       ran: true,
       found: anchorIds
@@ -514,7 +629,9 @@ test("embedded publisher keeps a hostile render reason inert in created Markdown
         ? [{ id: "identity", literal: "You are OpenClaw.", nearest: [] }]
         : [],
     },
-    renderCheck: { ran: false, reason },
+    renderCheck: renderModes
+      ? { ran: true, modes: renderModes }
+      : { ran: false, reason },
     issueTitle: "artifact-controlled title must be ignored",
     issueBody: "artifact-controlled body must be ignored",
     digest: "000000000000",
@@ -529,7 +646,11 @@ test("embedded publisher keeps a hostile render reason inert in created Markdown
         reason: hostileReason,
       }),
       versionEntry("2026.7.3-beta.1", ["beta"], {
-        reason: "render unavailable",
+        missingIdentity: true,
+        renderModes: {
+          default: { matched: true },
+          minimal: { matched: true },
+        },
       }),
     ],
   };

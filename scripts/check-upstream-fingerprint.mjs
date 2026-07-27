@@ -44,9 +44,10 @@
  * exports are selected statically from the `export {}` clause, so a bundle
  * that exports no prompt builder is never imported at all; and the import
  * that does happen runs in a child process with a scrubbed environment whose
- * `HOME` points into the work directory. A failure in (B) is reported as
- * "not run", never as drift — an import that cannot run tells us nothing
- * about the upstream prompt.
+ * `HOME` points into the work directory. A failure in (B) is reported as "not
+ * run" and never creates drift on its own — an import that cannot run tells us
+ * nothing about the upstream prompt — but an independently missing (A) anchor
+ * remains drift unless both supported real renders confirm the fingerprint.
  *
  * Drift is not a script failure. A broken script is. Missing anchors exit 0
  * and are reported for the workflow to open an issue about; a network
@@ -418,7 +419,7 @@ function findBuilderFiles(packageRoot, anchors) {
       const matchingAnchors = anchors.filter((anchor) =>
         literalIndex.found.has(anchor.literal),
       );
-      const hasBuilderExport = findBuilderExports(source).length > 0;
+      const hasBuilderExport = findBuilderExports(literalIndex.sourceFile).length > 0;
       // Three independent fingerprint anchors are strong content evidence on
       // their own. Two plus a statically visible builder export is also enough
       // for split/minified layouts. Crucially, no individual monitored anchor
@@ -427,6 +428,7 @@ function findBuilderFiles(packageRoot, anchors) {
         hits.push({
           file,
           source,
+          sourceFile: literalIndex.sourceFile,
           literalIndex: {
             found: literalIndex.found,
             literalLines: collectLiteralLines(literalIndex.sourceFile),
@@ -619,8 +621,8 @@ function readOpenClawDependencies(packageRoot) {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Parses the trailing `export { originalName as alias }` clause and keeps only
- * the aliases whose original name is a prompt builder.
+ * Inspects actual named `export { originalName as alias }` declarations and
+ * keeps only aliases whose original name is a prompt builder.
  *
  * This filter is a safety device, not a convenience. When it finds nothing the
  * module is never imported, which is exactly what should happen for the
@@ -628,19 +630,22 @@ function readOpenClawDependencies(packageRoot) {
  * `buildTtsSystemPromptHint` but no agent prompt builder, and importing them
  * runs OpenClaw's bootstrap against whatever `HOME` it is given.
  */
-function findBuilderExports(source) {
-  const clauses = source.match(/export\s*\{[^}]*\}/g);
-  if (!clauses) return [];
+function findBuilderExports(sourceFile) {
   const candidates = new Map();
-  for (const clause of clauses) {
-    for (const part of clause.replace(/^export\s*\{|\}$/g, "").split(",")) {
-      const named = /^\s*([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)\s*$/.exec(part);
-      const bare = /^\s*([A-Za-z_$][\w$]*)\s*$/.exec(part);
-      const original = named?.[1] ?? bare?.[1];
-      const alias = named?.[2] ?? bare?.[1];
-      if (original && alias && BUILDER_EXPORT_PATTERN.test(original)) {
-        candidates.set(alias, original);
-      }
+  for (const statement of sourceFile.statements) {
+    if (
+      !ts.isExportDeclaration(statement) ||
+      !statement.exportClause ||
+      !ts.isNamedExports(statement.exportClause)
+    ) {
+      continue;
+    }
+    for (const specifier of statement.exportClause.elements) {
+      const originalNode = specifier.propertyName ?? specifier.name;
+      if (!ts.isIdentifier(originalNode) || !ts.isIdentifier(specifier.name)) continue;
+      const original = originalNode.text;
+      const alias = specifier.name.text;
+      if (BUILDER_EXPORT_PATTERN.test(original)) candidates.set(alias, original);
     }
   }
   return [...candidates].map(([alias, original]) => ({ alias, original }));
@@ -803,7 +808,7 @@ function checkRenderedFingerprint({
   let candidateSetLimitExceeded = false;
 
   for (const builder of builders) {
-    const candidates = findBuilderExports(builder.source);
+    const candidates = findBuilderExports(builder.sourceFile);
     if (candidates.length === 0) {
       recordFailure(builder, `no export matched ${BUILDER_EXPORT_PATTERN}`);
       continue;
@@ -1019,19 +1024,10 @@ function inspectVersion({ version, tags, anchors, fingerprint, rootWorkDir, skip
     ? { ran: false, reason: "disabled with --skip-render" }
     : checkRenderedFingerprint({ version, fingerprint, workDir, anchors });
 
-  const driftReasons = [];
-  for (const anchor of literalCheck.missing) {
-    driftReasons.push(
-      `anchor \`${anchor.id}\` (${JSON.stringify(anchor.literal)}) is not present as a string literal`,
-    );
-  }
-  if (renderCheck.ran) {
-    for (const [mode, result] of Object.entries(renderCheck.modes)) {
-      if (!result.matched) {
-        driftReasons.push(`the fingerprint does not match the real ${mode} render`);
-      }
-    }
-  }
+  const { driftReasons, sourceLayoutDiagnostics } = classifyFingerprintFindings(
+    literalCheck,
+    renderCheck,
+  );
 
   return {
     version,
@@ -1045,7 +1041,33 @@ function inspectVersion({ version, tags, anchors, fingerprint, rootWorkDir, skip
     renderCheck,
     drift: driftReasons.length > 0,
     driftReasons,
+    sourceLayoutDiagnostics,
   };
+}
+
+function classifyFingerprintFindings(literalCheck, renderCheck) {
+  const supportedModesMatch =
+    renderCheck.ran === true &&
+    ["default", "minimal"].every((mode) => renderCheck.modes?.[mode]?.matched === true);
+  const sourceLayoutDiagnostics = supportedModesMatch
+    ? literalCheck.missing.map((anchor) => anchor.id)
+    : [];
+  const driftReasons = [];
+  if (!supportedModesMatch) {
+    for (const anchor of literalCheck.missing) {
+      driftReasons.push(
+        `anchor \`${anchor.id}\` (${JSON.stringify(anchor.literal)}) is not present as a string literal`,
+      );
+    }
+  }
+  if (renderCheck.ran) {
+    for (const [mode, result] of Object.entries(renderCheck.modes)) {
+      if (!result.matched) {
+        driftReasons.push(`the fingerprint does not match the real ${mode} render`);
+      }
+    }
+  }
+  return { driftReasons, sourceLayoutDiagnostics };
 }
 
 function inspectTargets({ targets, inspectTarget }) {
@@ -1076,6 +1098,10 @@ function describeCoverage(result) {
   return `(A) anchor literals only — (B) not run: ${result.renderCheck.reason}`;
 }
 
+function hasSourceLayoutDiagnostics(result) {
+  return result.sourceLayoutDiagnostics?.length > 0;
+}
+
 function renderHumanReport(results, failures = []) {
   const lines = [];
   for (const result of results) {
@@ -1083,9 +1109,11 @@ function renderHumanReport(results, failures = []) {
     lines.push("");
     const status = result.drift
       ? "DRIFT"
-      : result.renderCheck.ran
-        ? "PASS"
-        : "LAYER A PASS (PARTIAL)";
+      : hasSourceLayoutDiagnostics(result)
+        ? "PASS (SOURCE-LAYOUT DIAGNOSTIC)"
+        : result.renderCheck.ran
+          ? "PASS"
+          : "LAYER A PASS (PARTIAL)";
     lines.push(`openclaw@${result.version}${tagSuffix} — ${status}`);
     lines.push(`  checks run: ${describeCoverage(result)}`);
     lines.push(`  builder:    ${result.builderFiles.join(", ")}`);
@@ -1096,12 +1124,17 @@ function renderHumanReport(results, failures = []) {
       lines.push(`        ok      ${anchor.id.padEnd(15)} ${JSON.stringify(anchor.literal)}${where}`);
     }
     for (const anchor of result.literalCheck.missing) {
-      lines.push(`        MISSING ${anchor.id.padEnd(15)} ${JSON.stringify(anchor.literal)}`);
+      const label = hasSourceLayoutDiagnostics(result) ? "LAYOUT " : "MISSING";
+      lines.push(`        ${label} ${anchor.id.padEnd(15)} ${JSON.stringify(anchor.literal)}`);
       for (const near of anchor.nearest) {
         lines.push(`                  closest literal (${near.similarity}): ${JSON.stringify(near.literal)}`);
       }
       if (anchor.nearest.length === 0) {
-        lines.push("                  no similar literal in the builder — the anchor looks removed, not reworded");
+        lines.push(
+          hasSourceLayoutDiagnostics(result)
+            ? "                  not self-contained in source; both supported real renders matched"
+            : "                  no similar literal in the builder — the anchor looks removed, not reworded",
+        );
       }
     }
 
@@ -1138,9 +1171,21 @@ function renderHumanReport(results, failures = []) {
         .join(", ")}`,
     );
   } else if (results.some((result) => !result.renderCheck.ran)) {
+    if (results.some(hasSourceLayoutDiagnostics)) {
+      lines.push(
+        `No runtime drift found in ${results.length} watched release(s); Layer (A) reported ` +
+          "source-layout diagnostics, and real-render coverage was partial for at least one release.",
+      );
+    } else {
+      lines.push(
+        `Layer (A) passed for all ${results.length} watched release(s); coverage is partial, ` +
+          "so the full fingerprint was not verified for every release.",
+      );
+    }
+  } else if (results.some(hasSourceLayoutDiagnostics)) {
     lines.push(
-      `Layer (A) passed for all ${results.length} watched release(s); coverage is partial, ` +
-        "so the full fingerprint was not verified for every release.",
+      `All ${results.length} watched release(s) passed the real-render fingerprint check; ` +
+        "Layer (A) reported source-layout diagnostics above.",
     );
   } else {
     lines.push(`All ${results.length} watched release(s) passed the full fingerprint check.`);
@@ -1153,13 +1198,24 @@ function renderMarkdownReport(results, failures = []) {
     .map((result) => {
       if (result.drift) return renderIssueBody(result);
       const tags = result.tags.length > 0 ? ` (${result.tags.join(", ")})` : "";
-      const verdict = result.renderCheck.ran
-        ? "The anchor literals and real rendered prompt both passed."
+      const sourceLayoutDiagnostic = hasSourceLayoutDiagnostics(result);
+      const verdict = sourceLayoutDiagnostic
+        ? `Both supported real renders passed the fingerprint. Layer (A) could not find ` +
+          `${result.sourceLayoutDiagnostics.map((id) => `\`${id}\``).join(", ")} as a ` +
+          "self-contained source literal, so that finding is a source-layout diagnostic, not runtime drift."
+        : result.renderCheck.ran
+          ? "The anchor literals and real rendered prompt both passed."
         : "Layer (A) found every anchor literal. Coverage is partial; the full fingerprint was not verified.";
       return [
         `## openclaw@${result.version}${tags}`,
         "",
-        `- **Status:** ${result.renderCheck.ran ? "full fingerprint passed" : "Layer A passed (partial)"}`,
+        `- **Status:** ${
+          sourceLayoutDiagnostic
+            ? "real-render fingerprint passed (source-layout diagnostic)"
+            : result.renderCheck.ran
+              ? "full fingerprint passed"
+              : "Layer A passed (partial)"
+        }`,
         `- **Checks run:** ${describeCoverage(result)}`,
         `- **Prompt builder:** \`${result.builderFiles.join("`, `")}\``,
         "",
@@ -1185,9 +1241,14 @@ function renderMarkdownReport(results, failures = []) {
 
 /** A stable id for one drift finding, so the workflow can tell repeats from changes. */
 function driftDigest(result) {
+  const renderFullyMatches =
+    result.renderCheck.ran &&
+    ["default", "minimal"].every((mode) => result.renderCheck.modes?.[mode]?.matched === true);
   const shape = JSON.stringify({
     version: result.version,
-    missing: result.literalCheck.missing.map((anchor) => anchor.id).sort(),
+    missing: renderFullyMatches
+      ? []
+      : result.literalCheck.missing.map((anchor) => anchor.id).sort(),
     unmatched: result.renderCheck.ran
       ? Object.entries(result.renderCheck.modes)
           .filter(([, mode]) => !mode.matched)
@@ -1431,7 +1492,9 @@ export {
   CheckError,
   checkAnchorLiterals,
   checkRenderedFingerprint,
+  classifyFingerprintFindings,
   describeCoverage,
+  findBuilderExports,
   findBuilderFiles,
   inspectTargets,
   renderHumanReport,

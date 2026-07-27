@@ -75,6 +75,7 @@ jobs:
           path: |
             ${{ runner.temp }}/fingerprint-report.json
             ${{ runner.temp }}/fingerprint-report.md
+          overwrite: true
           if-no-files-found: ignore
           retention-days: 30
 
@@ -373,13 +374,15 @@ jobs:
 
               normalizedMissing.sort((left, right) => left.id.localeCompare(right.id));
               unmatched.sort();
-              const recomputedDrift = normalizedMissing.length > 0 || unmatched.length > 0;
+              const renderFullyMatches = renderCheck.ran && unmatched.length === 0;
+              const driftMissing = renderFullyMatches ? [] : normalizedMissing;
+              const recomputedDrift = driftMissing.length > 0 || unmatched.length > 0;
               if (entry.drift !== recomputedDrift) {
                 fail(`versions[${index}].drift disagrees with normalized findings`);
               }
               const shape = JSON.stringify({
                 version: entry.version,
-                missing: normalizedMissing.map((anchor) => anchor.id),
+                missing: driftMissing.map((anchor) => anchor.id),
                 unmatched,
               });
               const digest = crypto.createHash("sha256").update(shape).digest("hex").slice(0, 12);
@@ -395,7 +398,7 @@ jobs:
                 "## Normalized drift facts",
                 "",
               ];
-              for (const anchor of normalizedMissing) {
+              for (const anchor of driftMissing) {
                 body.push(`- Missing anchor **${anchor.id}**: \`${anchor.literal}\``);
                 for (const candidate of anchor.nearest) {
                   body.push(

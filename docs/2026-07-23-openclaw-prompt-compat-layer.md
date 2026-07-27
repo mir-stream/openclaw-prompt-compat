@@ -333,7 +333,7 @@ node scripts/check-upstream-fingerprint.mjs 2026.7.1 2026.3.24
 | 층 | 방법 | 잡는 것 | 실행 조건 |
 | --- | --- | --- | --- |
 | (A) 앵커 리터럴 존재 | `npm pack` 후 TypeScript parser로 JavaScript string/template literal을 식별해 각 앵커를 찾는다. 코드 실행 없음 | 앵커의 삭제·개작 | 항상 |
-| (B) 실제 렌더 + 지문 대조 | 임시 디렉터리에 설치하고 빌더를 import해 렌더한 뒤 `OPENCLAW_SYSTEM_PROMPT_FINGERPRINT`를 돌린다 | 앵커는 다 있는데 **순서**만 바뀐 경우 | 가능할 때만 |
+| (B) 실제 렌더 + 지문 대조 | 임시 디렉터리에 설치하고 빌더를 import해 렌더한 뒤 `OPENCLAW_SYSTEM_PROMPT_FINGERPRINT`를 돌린다 | 앵커는 다 있는데 **순서**만 바뀐 경우, (A)의 source-layout 진단 여부 | 가능할 때만 |
 
 `2026.7.2` 사고는 (A)만으로 잡힌다. 프리앰블 리터럴이 통째로 사라졌기 때문이다. 실제로 `0.2.0` 지문으로
 `2026.7.2-beta.4`를 검사하면 (A)가 다음을 보고한다.
@@ -349,6 +349,7 @@ MISSING toolingPreamble "Available tools are policy-filtered. Names are case-sen
 **(B)는 반드시 격리한다.** 빌더 import에는 부작용이 있을 수 있다. `2026.2.26`·`2026.3.24`는 빌더가
 monolithic CLI 번들 안에 있어 import만으로 `~/.openclaw`를 읽고 bootstrap을 돌린 뒤 throw한다
 (조사 문서 §8.1). 방어는 두 겹이다. 첫째, import할 export를 `export {}` 절에서 **정적으로** 고른다.
+TypeScript AST의 실제 export declaration만 인정하므로 주석이나 문자열 속 export 모양은 후보가 아니다.
 프롬프트 빌더를 export하지 않는 번들은 애초에 import되지 않는다 — `2026.3.24`가 여기서 걸러진다.
 둘째, 실제로 일어나는 import는 `HOME`을 임시 디렉터리로 바꾼 자식 프로세스에서 타임아웃과 함께 돈다.
 content quorum에 맞는 파일·export가 여럿이면 한 후보의 import·render 실패로 멈추지 않고 모든 후보를
@@ -357,10 +358,15 @@ content quorum에 맞는 파일·export가 여럿이면 한 후보의 import·re
 불가능한 후보 이유를 제한된 길이로 남긴 채 (B) 미실행으로 보고한다. 정적 후보 수가 실행 상한을
 넘는 파일도 일부를 건너뛰어 판정하지 않고 (B) 전체를 fail-closed한다.
 (B)의 설치가 시작되지 못하거나 timeout된 경우를 포함해, (B)가 못 돌면 "(A)만 수행됨"으로 보고하고
-**drift로 취급하지 않는다.** 돌지 못한 검사는 업스트림에 대해 아무것도 말해주지 않는다.
+그 실패 자체는 drift로 취급하지 않는다. 돌지 못한 검사는 업스트림에 대해 아무것도 말해주지 않지만,
+(A)가 찾은 누락은 독립적인 drift로 남는다. 반대로 (A)가 self-contained 리터럴을 찾지 못했더라도
+(B)의 default/minimal 실제 렌더가 **둘 다** 지문과 일치하면 런타임 구조는 확인된 것이므로 그 누락은
+source-layout 진단으로만 보고한다. (B)가 못 돌거나 어느 한 모드라도 불일치하면 (A)의 누락은 계속
+drift이며, 렌더 불일치도 별도의 drift다.
 
 콘솔·Markdown·Actions summary는 버전마다 어떤 검사가 실제로 돌았는지 항상 명시한다. (A)만 돌았으면
-"Layer A 통과(부분 검사)"라고 쓰며 전체 지문이 일치한다고 말하지 않는다.
+"Layer A 통과(부분 검사)"라고 쓰며 전체 지문이 일치한다고 말하지 않는다. 실제 렌더가 둘 다 통과해
+(A) 누락을 source-layout 진단으로 낮춘 경우에도 두 층이 모두 통과했다고 쓰지 않고 그 진단을 명시한다.
 
 ### 6.2 빌더 파일은 이름이 아니라 내용으로 찾는다
 

@@ -1,7 +1,7 @@
 # OpenClaw 시스템 프롬프트 호환 플러그인
 
 작성: 2026-07-23
-상태: **플러그인 구현·npm 0.1.0 게시·게시본 acceptance 완료, setup 배포 전**
+상태: **npm `0.2.0` 게시 완료(identity 문장 설정 가능), 게시본 acceptance 재실행 전·setup 배포 전**
 검증 기준: OpenClaw `2026.7.1` (`v2026.7.1`, commit
 `2d2ddc43d0dcf71f31283d780f9fe9ff4cc04fe4`)
 
@@ -164,6 +164,8 @@ openclaw plugins install \
 
 ## 5. 검증 결과
 
+### 5.1 `0.1.0` (2026-07-23)
+
 2026-07-23에 다음 검증을 완료했다.
 
 | 검증 | 결과 |
@@ -187,6 +189,26 @@ Z.AI 검증은 별도 임시 `HOME`, `OPENCLAW_STATE_DIR`, `OPENCLAW_CONFIG_PATH
 기동해 수행했다. API key는 process environment에만 넣었고 onboarding, auth profile, config, `.env`에는
 기록하지 않았다. 검증 후 Gateway를 종료하고 환경변수를 해제했다.
 
+### 5.2 `0.2.0` (2026-07-27)
+
+| 검증 | 결과 |
+| --- | --- |
+| identity 설정·`$` 치환 시퀀스·multi-line·잘못된 값 폴백·설정 시 지문 스코프 불변 | Node test 29개 통과 |
+| TypeScript | typecheck·build 통과 |
+| npm artifact | 8 files, 8.0 kB, unpacked 25,423 B, source/test 제외 |
+| npm registry | `@mir-stream/openclaw-prompt-compat@0.2.0` public 게시, shasum `2e511ba20ab43f15d024767459c4d0ba0b18f136`, `latest` tag |
+| config path 표기 | dot·bracket 양쪽 모두 `openclaw config get`으로 조회됨 |
+| strict schema gate | `identitySentence`를 선언하지 않은 설치본에서는 batch `config set --dry-run`이 `must not have additional properties`로 거부 |
+
+`config set`의 value 모드 dry-run은 스키마 검증을 건너뛴다. non-interactive setup에서 잘못된 키나
+미설치 버전을 조용히 기록하지 않으려면 검증이 도는 batch 모드를 쓴다.
+
+`0.2.0`에서 아직 재실행하지 않은 검증은 다음과 같다. `0.1.0` 기준 결과만 있다.
+
+- 게시본 managed npm install acceptance
+- mock outbound payload 확인 (설정한 문장이 provider payload까지 도달하는지)
+- Z.AI live Gateway turn
+
 ## 6. `setup_openclaw` 통합 계약
 
 `mir-stream/rota-crew`의 `setup_openclaw`는 다음과 같이 맞춘다.
@@ -206,7 +228,10 @@ Z.AI 검증은 별도 임시 `HOME`, `OPENCLAW_STATE_DIR`, `OPENCLAW_CONFIG_PATH
 
 npm package가 게시되기 전에는 이 setup 변경을 공개 배포하지 않는다. 로컬 코드 통합과 shell 검증을
 먼저 끝내고, 해당 version 게시 후 package install acceptance를 다시 통과시킨 뒤 배포한다. `0.2.0`은
-아직 게시 전이다.
+게시했으나 install acceptance는 아직 재실행하지 않았다.
+
+`identitySentence`를 setup이 함께 설정한다면 순서가 중요하다. strict config schema는 해당 키를
+선언한 버전이 설치되기 전에는 값을 거부하므로, `0.2.0` 이상 설치를 끝낸 뒤 config를 기록한다.
 
 ## 7. 롤백
 
@@ -235,6 +260,9 @@ setup 재실행은 명시적 disable을 보존한다. 완전 제거 후 setup을
 - [x] Z.AI Coding Plan live agent turn이 성공했다.
 - [x] `@mir-stream/openclaw-prompt-compat@0.1.0`을 npm에 게시한다.
 - [x] 게시된 npm artifact로 package acceptance를 다시 실행한다.
+- [x] identity 교체 문장을 `identitySentence`로 설정 가능하게 만든다.
+- [x] `@mir-stream/openclaw-prompt-compat@0.2.0`을 npm에 게시한다.
+- [ ] `0.2.0` 게시본으로 install·mock outbound·live turn acceptance를 재실행한다.
 - [ ] `setup_openclaw` 변경을 배포하고 새 설치·재실행·disable 보존을 확인한다.
 
 ## 9. 검토 근거

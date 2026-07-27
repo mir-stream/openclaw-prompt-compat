@@ -350,6 +350,8 @@ monolithic CLI 번들 안에 있어 import만으로 `~/.openclaw`를 읽고 boot
 (조사 문서 §8.1). 방어는 두 겹이다. 첫째, import할 export를 `export {}` 절에서 **정적으로** 고른다.
 프롬프트 빌더를 export하지 않는 번들은 애초에 import되지 않는다 — `2026.3.24`가 여기서 걸러진다.
 둘째, 실제로 일어나는 import는 `HOME`을 임시 디렉터리로 바꾼 자식 프로세스에서 타임아웃과 함께 돈다.
+content quorum에 맞는 파일이 여럿이면 한 후보의 import·render 실패로 멈추지 않고 뒤 후보를 계속
+검사한다. 모든 후보가 실패한 경우에만, 후보별 이유를 제한된 길이로 모아 (B) 미실행으로 보고한다.
 (B)의 설치가 시작되지 못하거나 timeout된 경우를 포함해, (B)가 못 돌면 "(A)만 수행됨"으로 보고하고
 **drift로 취급하지 않는다.** 돌지 못한 검사는 업스트림에 대해 아무것도 말해주지 않는다.
 
@@ -378,11 +380,17 @@ ok  cacheBoundary "<!-- OPENCLAW_CACHE_BOUNDARY -->"  <- @openclaw/ai@2026.7.1:d
 신호는 깨진 앵커가 적힌 이슈다. 반대로 **검사기 자체가 고장나면 exit 1로 실패한다** — 네트워크 실패,
 tarball 손상, 빌더 식별 불가. 이때는 아무것도 검사되지 않은 것이므로 drift와는 다른, 더 나쁜 사건이다.
 step summary도 "검사가 안 돌았다"와 "검사했는데 문제 없다"를 다르게 쓴다.
+한 target이 실패해도 나머지 target 검사는 계속한다. 완료된 target과 실패한 target/error를 콘솔·JSON·
+Markdown에 모두 남긴 뒤 전체 실행은 exit 1로 끝난다. 따라서 부분 성공의 증거는 보존되지만 publish
+job은 실행되지 않는다.
 
 권한 경계도 두 job으로 나뉜다. `check` job은 `contents: read`만 갖고 checkout credential을 남기지
 않은 채 (A)/(B)를 실행해 리포트 artifact를 만든다. `issues: write`는 별도 runner의 `publish` job만
-가지며, 이 job은 checkout이나 OpenClaw import를 하지 않고 artifact의 JSON schema를 검증한 뒤 이슈
-API만 호출한다. 같은 schedule/manual 실행이 겹쳐 중복 이슈를 만들지 않도록 workflow 전용
+가지며, 이 job은 checkout이나 OpenClaw import를 하지 않는다. artifact의 모든 바이트는 신뢰하지
+않는다. publish job이 npm `latest`·`beta`를 독립적으로 다시 조회해 정확한 버전 집합을 요구하고,
+허용된 앵커 id와 render mode만 정규화한다. artifact의 title/body/digest는 버리고, 제한된 plain-text
+finding에서 본문과 digest를 다시 만든 뒤 이슈 API를 호출한다. 두 조회 사이 tag가 바뀌어도 mismatch로
+fail-closed한다. 같은 schedule/manual 실행이 겹쳐 중복 이슈를 만들지 않도록 workflow 전용
 concurrency group도 직렬화한다.
 
 drift가 있으면 `upstream-drift` 라벨로 이슈를 연다. 매일 도는 잡이므로 중복 방지가 필수다. 이슈 본문에

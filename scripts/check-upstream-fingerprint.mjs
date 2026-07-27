@@ -717,9 +717,19 @@ function checkRenderedFingerprint({
     return { ran: false, reason: `builder not found in installed tree: ${error.message}` };
   }
 
+  const failures = [];
+  const recordFailure = (builder, reason) => {
+    if (failures.length >= 8) return;
+    const name = path.relative(installedRoot, builder.file);
+    failures.push(`${name}: ${String(reason).replace(/\s+/g, " ").slice(0, 300)}`);
+  };
+
   for (const builder of builders) {
     const candidates = findBuilderExports(builder.source);
-    if (candidates.length === 0) continue;
+    if (candidates.length === 0) {
+      recordFailure(builder, `no export matched ${BUILDER_EXPORT_PATTERN}`);
+      continue;
+    }
 
     const probePath = path.join(workDir, "render-probe.mjs");
     writeFileSync(probePath, RENDER_PROBE_SOURCE);
@@ -738,44 +748,63 @@ function checkRenderedFingerprint({
     );
 
     if (child.error) {
-      return { ran: false, reason: `render probe failed to start: ${child.error.message}` };
+      recordFailure(builder, `render probe failed to start: ${child.error.message}`);
+      continue;
     }
     const marker = (child.stdout ?? "").lastIndexOf(RENDER_PROBE_SENTINEL);
     if (marker === -1) {
       const detail = child.signal
         ? `killed by ${child.signal} (likely the ${RENDER_TIMEOUT_MS} ms timeout)`
         : `exited ${child.status} without a result`;
-      return { ran: false, reason: `render probe ${detail}` };
+      recordFailure(builder, `render probe ${detail}`);
+      continue;
     }
 
     let payload;
     try {
       payload = JSON.parse(child.stdout.slice(marker + RENDER_PROBE_SENTINEL.length));
     } catch (error) {
-      return { ran: false, reason: `render probe output was unparsable: ${error.message}` };
+      recordFailure(builder, `render probe output was unparsable: ${error.message}`);
+      continue;
     }
     if (!payload.ok) {
-      return { ran: false, reason: payload.reason };
+      recordFailure(builder, payload.reason ?? "render probe returned no reason");
+      continue;
     }
 
-    const modes = {};
-    for (const [mode, rendered] of Object.entries(payload.renders)) {
-      modes[mode] = {
-        matched: fingerprint.test(rendered),
-        firstLine: rendered.split("\n", 1)[0],
-        headings: rendered
-          .split("\n")
-          .filter((line) => line.startsWith("## ") || line.includes("CACHE_BOUNDARY")),
-      };
+    try {
+      if (
+        typeof payload.builderExport !== "string" ||
+        !BUILDER_EXPORT_PATTERN.test(payload.builderExport) ||
+        !payload.renders ||
+        typeof payload.renders !== "object"
+      ) {
+        throw new Error("render probe returned an invalid success payload");
+      }
+      const modes = {};
+      for (const mode of ["default", "minimal"]) {
+        const rendered = payload.renders[mode];
+        if (typeof rendered !== "string" || rendered.length === 0) {
+          throw new Error(`render probe omitted the ${mode} prompt`);
+        }
+        modes[mode] = {
+          matched: fingerprint.test(rendered),
+          firstLine: rendered.split("\n", 1)[0],
+          headings: rendered
+            .split("\n")
+            .filter((line) => line.startsWith("## ") || line.includes("CACHE_BOUNDARY")),
+        };
+      }
+      return { ran: true, builderExport: payload.builderExport, modes };
+    } catch (error) {
+      recordFailure(builder, error.message);
+      continue;
     }
-    return { ran: true, builderExport: payload.builderExport, modes };
   }
 
   return {
     ran: false,
-    reason:
-      "no builder export matched " +
-      `${BUILDER_EXPORT_PATTERN} — the module was not imported, so nothing was executed`,
+    reason: `all ${builders.length} builder candidate(s) were exhausted: ${failures.join("; ")}`,
   };
 }
 
@@ -826,6 +855,23 @@ function inspectVersion({ version, tags, anchors, fingerprint, rootWorkDir, skip
   };
 }
 
+function inspectTargets({ targets, inspectTarget }) {
+  const results = [];
+  const failures = [];
+  for (const target of targets) {
+    try {
+      results.push(inspectTarget(target));
+    } catch (error) {
+      failures.push({
+        version: target.version,
+        tags: target.tags,
+        error: String(error?.message ?? error).replace(/\s+/g, " ").slice(0, 1000),
+      });
+    }
+  }
+  return { results, failures };
+}
+
 /* -------------------------------------------------------------------------- */
 /* Reporting                                                                   */
 /* -------------------------------------------------------------------------- */
@@ -837,7 +883,7 @@ function describeCoverage(result) {
   return `(A) anchor literals only — (B) not run: ${result.renderCheck.reason}`;
 }
 
-function renderHumanReport(results) {
+function renderHumanReport(results, failures = []) {
   const lines = [];
   for (const result of results) {
     const tagSuffix = result.tags.length > 0 ? ` [${result.tags.join(", ")}]` : "";
@@ -878,9 +924,21 @@ function renderHumanReport(results) {
     }
   }
 
+  for (const failure of failures) {
+    const tagSuffix = failure.tags.length > 0 ? ` [${failure.tags.join(", ")}]` : "";
+    lines.push("");
+    lines.push(`openclaw@${failure.version}${tagSuffix} — CHECK FAILED`);
+    lines.push(`  error: ${failure.error}`);
+  }
+
   const drifted = results.filter((result) => result.drift);
   lines.push("");
-  if (drifted.length > 0) {
+  if (failures.length > 0) {
+    lines.push(
+      `Completed ${results.length} target(s); ${failures.length} target(s) failed. ` +
+        "The completed coverage above is retained, but the watch is incomplete.",
+    );
+  } else if (drifted.length > 0) {
     lines.push(
       `Fingerprint drift in ${drifted.length} of ${results.length} watched release(s): ${drifted
         .map((result) => result.version)
@@ -897,8 +955,8 @@ function renderHumanReport(results) {
   return lines.join("\n");
 }
 
-function renderMarkdownReport(results) {
-  return results
+function renderMarkdownReport(results, failures = []) {
+  const completed = results
     .map((result) => {
       if (result.drift) return renderIssueBody(result);
       const tags = result.tags.length > 0 ? ` (${result.tags.join(", ")})` : "";
@@ -916,6 +974,20 @@ function renderMarkdownReport(results) {
       ].join("\n");
     })
     .join("\n\n---\n\n");
+  const failed = failures
+    .map((failure) => {
+      const tags = failure.tags.length > 0 ? ` (${failure.tags.join(", ")})` : "";
+      return [
+        `## openclaw@${failure.version}${tags}`,
+        "",
+        "- **Status:** check failed",
+        `- **Error:** ${failure.error}`,
+        "",
+        "No conclusion is available for this target. Other completed target results remain valid.",
+      ].join("\n");
+    })
+    .join("\n\n---\n\n");
+  return [completed, failed].filter(Boolean).join("\n\n---\n\n");
 }
 
 /** A stable id for one drift finding, so the workflow can tell repeats from changes. */
@@ -1085,9 +1157,9 @@ async function main() {
       `Work dir:    ${rootWorkDir}\n`,
   );
 
-  const results = [];
-  for (const target of targets) {
-    results.push(
+  const { results, failures } = inspectTargets({
+    targets,
+    inspectTarget: (target) =>
       inspectVersion({
         version: target.version,
         tags: target.tags,
@@ -1096,10 +1168,9 @@ async function main() {
         rootWorkDir,
         skipRender: options.skipRender,
       }),
-    );
-  }
+  });
 
-  process.stdout.write(`${renderHumanReport(results)}\n`);
+  process.stdout.write(`${renderHumanReport(results, failures)}\n`);
 
   const drifted = results.filter((result) => result.drift);
   const report = {
@@ -1107,6 +1178,7 @@ async function main() {
     watchedDistTags: options.versions.length > 0 ? null : WATCHED_DIST_TAGS,
     fingerprintSource: fingerprint.source,
     drift: drifted.length > 0,
+    incomplete: failures.length > 0,
     versions: results.map((result) => ({
       ...result,
       coverage: describeCoverage(result),
@@ -1114,6 +1186,7 @@ async function main() {
       issueTitle: `OpenClaw ${result.version}: system-prompt fingerprint no longer matches`,
       issueBody: result.drift ? renderIssueBody(result) : null,
     })),
+    failures,
   };
 
   if (options.json) {
@@ -1126,7 +1199,7 @@ async function main() {
     mkdirSync(path.dirname(path.resolve(options.markdown)), { recursive: true });
     writeFileSync(
       options.markdown,
-      `${renderMarkdownReport(results)}\n`,
+      `${renderMarkdownReport(results, failures)}\n`,
     );
     process.stdout.write(`Markdown report: ${options.markdown}\n`);
   }
@@ -1135,12 +1208,15 @@ async function main() {
     appendFileSync(
       process.env.GITHUB_OUTPUT,
       `drift=${drifted.length > 0}\n` +
-        `drift_versions=${drifted.map((result) => result.version).join(",")}\n`,
+        `drift_versions=${drifted.map((result) => result.version).join(",")}\n` +
+        `completed_targets=${results.length}\n` +
+        `failed_targets=${failures.length}\n`,
     );
   }
 
-  // Drift is a finding about upstream, not a failure of this check.
-  process.exitCode = 0;
+  // Drift is a finding about upstream, not a failure of this check. A target
+  // failure is a broken/incomplete watch even though completed coverage is kept.
+  process.exitCode = failures.length > 0 ? 1 : 0;
 }
 
 const isMain =
@@ -1164,6 +1240,7 @@ export {
   checkRenderedFingerprint,
   describeCoverage,
   findBuilderFiles,
+  inspectTargets,
   renderHumanReport,
   renderMarkdownReport,
 };

@@ -85,14 +85,27 @@ jobs:
         if: always()
         env:
           CHECK_OUTCOME: ${{ steps.check.outcome }}
+          COMPLETED_TARGETS: ${{ steps.check.outputs.completed_targets }}
           REPORT_MD: ${{ runner.temp }}/fingerprint-report.md
         run: |
           if [ "$CHECK_OUTCOME" != "success" ]; then
             {
               echo "### Fingerprint watch did not complete"
               echo
-              echo "The check step ended as \`$CHECK_OUTCOME\`, so nothing was verified."
-              echo "This is a failure of the watch, not a finding about upstream."
+              echo "The check step ended as \`$CHECK_OUTCOME\`."
+              if [ -s "$REPORT_MD" ]; then
+                if [ "${COMPLETED_TARGETS:-0}" -gt 0 ]; then
+                  echo "Completed target coverage is retained below; failed targets remain unverified."
+                else
+                  echo "No target completed, so nothing was verified."
+                fi
+                echo
+                cat "$REPORT_MD"
+              else
+                echo "No target completed, so nothing was verified."
+              fi
+              echo
+              echo "This incomplete run is a failure of the watch, not a finding about upstream."
             } >> "$GITHUB_STEP_SUMMARY"
           else
             cat "$REPORT_MD" >> "$GITHUB_STEP_SUMMARY"
@@ -122,56 +135,300 @@ jobs:
           REPORT_PATH: ${{ runner.temp }}/fingerprint-report/fingerprint-report.json
         with:
           script: |
+            const crypto = require("node:crypto");
+            const { execFileSync } = require("node:child_process");
             const fs = require("node:fs");
+            const reportBytes = fs.statSync(process.env.REPORT_PATH).size;
+            if (reportBytes > 1024 * 1024) {
+              throw new Error("Invalid fingerprint report: artifact exceeds 1 MiB");
+            }
             const report = JSON.parse(fs.readFileSync(process.env.REPORT_PATH, "utf8"));
             const LABEL = "upstream-drift";
+            const ANCHOR_IDS = new Set([
+              "identity",
+              "tooling",
+              "safety",
+              "workspace",
+              "workspaceFiles",
+              "cacheBoundary",
+              "runtime",
+            ]);
+            const RENDER_MODES = new Set(["default", "minimal"]);
 
             const fail = (message) => {
               throw new Error(`Invalid fingerprint report: ${message}`);
             };
+            const plainText = (value, field, inputLimit = 1000, outputLimit = 300) => {
+              if (typeof value !== "string" || value.length > inputLimit) {
+                fail(`${field} must be a string of at most ${inputLimit} characters`);
+              }
+              return value
+                .replace(/[\u0000-\u001f\u007f]+/g, " ")
+                .replace(/<!--/g, "&lt;!--")
+                .replace(/-->/g, "--&gt;")
+                .replace(/`/g, "&#96;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/\s+/g, " ")
+                .trim()
+                .slice(0, outputLimit);
+            };
+            const expectArray = (value, field, limit) => {
+              if (!Array.isArray(value) || value.length > limit) {
+                fail(`${field} must be an array with at most ${limit} entries`);
+              }
+              return value;
+            };
+            const expectObject = (value, field) => {
+              if (!value || typeof value !== "object" || Array.isArray(value)) {
+                fail(`${field} must be an object`);
+              }
+              return value;
+            };
+
+            let distTags;
+            try {
+              distTags = JSON.parse(
+                execFileSync("npm", ["view", "openclaw", "dist-tags", "--json"], {
+                  encoding: "utf8",
+                  timeout: 60000,
+                  maxBuffer: 1024 * 1024,
+                }),
+              );
+            } catch (error) {
+              throw new Error(`Cannot independently resolve OpenClaw dist-tags: ${error.message}`);
+            }
+            const versionPattern = /^[0-9A-Za-z][0-9A-Za-z.+-]{0,127}$/;
+            const expectedTagsByVersion = new Map();
+            for (const tag of ["latest", "beta"]) {
+              const version = distTags?.[tag];
+              if (typeof version !== "string" || !versionPattern.test(version)) {
+                throw new Error(`npm dist-tag ${tag} returned an invalid version`);
+              }
+              const tags = expectedTagsByVersion.get(version) ?? [];
+              tags.push(tag);
+              expectedTagsByVersion.set(version, tags);
+            }
+
             if (!report || typeof report !== "object" || Array.isArray(report)) fail("root must be an object");
-            if (report.drift !== true) fail("drift must be true in a publication report");
-            if (!Array.isArray(report.versions) || report.versions.length < 1 || report.versions.length > 20) {
-              fail("versions must contain 1-20 entries");
+            if (report.incomplete !== false) fail("incomplete must be false");
+            if (
+              !Array.isArray(report.watchedDistTags) ||
+              report.watchedDistTags.length !== 2 ||
+              report.watchedDistTags[0] !== "latest" ||
+              report.watchedDistTags[1] !== "beta"
+            ) {
+              fail("watchedDistTags must be exactly latest,beta");
             }
-            for (const [index, version] of report.versions.entries()) {
-              if (!version || typeof version !== "object" || Array.isArray(version)) {
-                fail(`versions[${index}] must be an object`);
-              }
+            if (
+              !Array.isArray(report.versions) ||
+              report.versions.length !== expectedTagsByVersion.size
+            ) {
+              fail("versions must exactly match the unique current latest/beta version set");
+            }
+
+            const seenVersions = new Set();
+            const normalizedVersions = [];
+            for (const [index, rawVersion] of report.versions.entries()) {
+              const entry = expectObject(rawVersion, `versions[${index}]`);
               if (
-                typeof version.version !== "string" ||
-                !/^[0-9A-Za-z][0-9A-Za-z.+-]{0,127}$/.test(version.version)
+                typeof entry.version !== "string" ||
+                !expectedTagsByVersion.has(entry.version) ||
+                seenVersions.has(entry.version)
               ) {
-                fail(`versions[${index}].version is invalid`);
+                fail(`versions[${index}].version is unexpected or duplicated`);
               }
-              if (typeof version.drift !== "boolean") fail(`versions[${index}].drift must be boolean`);
+              seenVersions.add(entry.version);
+              const expectedEntryTags = expectedTagsByVersion.get(entry.version);
               if (
-                typeof version.digest !== "string" ||
-                !/^[a-f0-9]{12}$/.test(version.digest)
+                !Array.isArray(entry.tags) ||
+                entry.tags.length !== expectedEntryTags.length ||
+                entry.tags.some((tag, tagIndex) => tag !== expectedEntryTags[tagIndex])
               ) {
-                fail(`versions[${index}].digest is invalid`);
+                fail(`versions[${index}].tags do not match the current dist-tag mapping`);
               }
-              if (
-                typeof version.issueTitle !== "string" ||
-                version.issueTitle.length < 1 ||
-                version.issueTitle.length > 256
-              ) {
-                fail(`versions[${index}].issueTitle is invalid`);
+
+              const literalCheck = expectObject(
+                entry.literalCheck,
+                `versions[${index}].literalCheck`,
+              );
+              if (literalCheck.ran !== true) {
+                fail(`versions[${index}].literalCheck.ran must be true`);
               }
-              if (version.drift) {
-                if (
-                  typeof version.issueBody !== "string" ||
-                  version.issueBody.length < 1 ||
-                  version.issueBody.length > 60000
-                ) {
-                  fail(`versions[${index}].issueBody is invalid`);
+              const found = expectArray(
+                literalCheck.found,
+                `versions[${index}].literalCheck.found`,
+                ANCHOR_IDS.size,
+              );
+              const missing = expectArray(
+                literalCheck.missing,
+                `versions[${index}].literalCheck.missing`,
+                ANCHOR_IDS.size,
+              );
+              const seenAnchors = new Set();
+              for (const [foundIndex, rawFound] of found.entries()) {
+                const item = expectObject(
+                  rawFound,
+                  `versions[${index}].literalCheck.found[${foundIndex}]`,
+                );
+                if (!ANCHOR_IDS.has(item.id) || seenAnchors.has(item.id)) {
+                  fail(`versions[${index}] has an invalid or duplicate found anchor`);
                 }
-              } else if (version.issueBody !== null) {
-                fail(`versions[${index}].issueBody must be null without drift`);
+                seenAnchors.add(item.id);
               }
+              const normalizedMissing = [];
+              for (const [missingIndex, rawMissing] of missing.entries()) {
+                const item = expectObject(
+                  rawMissing,
+                  `versions[${index}].literalCheck.missing[${missingIndex}]`,
+                );
+                if (!ANCHOR_IDS.has(item.id) || seenAnchors.has(item.id)) {
+                  fail(`versions[${index}] has an invalid or duplicate missing anchor`);
+                }
+                seenAnchors.add(item.id);
+                const nearest = expectArray(
+                  item.nearest,
+                  `versions[${index}].literalCheck.missing[${missingIndex}].nearest`,
+                  3,
+                ).map((rawNearest, nearestIndex) => {
+                  const candidate = expectObject(
+                    rawNearest,
+                    `versions[${index}].missing[${missingIndex}].nearest[${nearestIndex}]`,
+                  );
+                  if (
+                    typeof candidate.similarity !== "number" ||
+                    !Number.isFinite(candidate.similarity) ||
+                    candidate.similarity < 0 ||
+                    candidate.similarity > 1
+                  ) {
+                    fail(`versions[${index}] has an invalid nearest similarity`);
+                  }
+                  return {
+                    literal: plainText(
+                      candidate.literal,
+                      `versions[${index}].missing[${missingIndex}].nearest[${nearestIndex}].literal`,
+                      1000,
+                      300,
+                    ),
+                    similarity: candidate.similarity.toFixed(3),
+                  };
+                });
+                normalizedMissing.push({
+                  id: item.id,
+                  literal: plainText(
+                    item.literal,
+                    `versions[${index}].literalCheck.missing[${missingIndex}].literal`,
+                    1000,
+                    300,
+                  ),
+                  nearest,
+                });
+              }
+              if (seenAnchors.size !== ANCHOR_IDS.size) {
+                fail(`versions[${index}] must account for every monitored anchor exactly once`);
+              }
+
+              const renderCheck = expectObject(
+                entry.renderCheck,
+                `versions[${index}].renderCheck`,
+              );
+              if (typeof renderCheck.ran !== "boolean") {
+                fail(`versions[${index}].renderCheck.ran must be boolean`);
+              }
+              const unmatched = [];
+              let renderCoverage;
+              if (renderCheck.ran) {
+                const modes = expectObject(
+                  renderCheck.modes,
+                  `versions[${index}].renderCheck.modes`,
+                );
+                const modeNames = Object.keys(modes);
+                if (
+                  modeNames.length !== RENDER_MODES.size ||
+                  modeNames.some((mode) => !RENDER_MODES.has(mode))
+                ) {
+                  fail(`versions[${index}] must report exactly default and minimal render modes`);
+                }
+                for (const mode of [...RENDER_MODES]) {
+                  const modeResult = expectObject(
+                    modes[mode],
+                    `versions[${index}].renderCheck.modes.${mode}`,
+                  );
+                  if (typeof modeResult.matched !== "boolean") {
+                    fail(`versions[${index}].renderCheck.modes.${mode}.matched must be boolean`);
+                  }
+                  if (!modeResult.matched) unmatched.push(mode);
+                }
+                renderCoverage = "(A) anchor literals + (B) real render vs fingerprint";
+              } else {
+                const reason = plainText(
+                  renderCheck.reason,
+                  `versions[${index}].renderCheck.reason`,
+                  1000,
+                  300,
+                );
+                renderCoverage = `(A) anchor literals only — (B) not run: ${reason}`;
+              }
+
+              normalizedMissing.sort((left, right) => left.id.localeCompare(right.id));
+              unmatched.sort();
+              const recomputedDrift = normalizedMissing.length > 0 || unmatched.length > 0;
+              if (entry.drift !== recomputedDrift) {
+                fail(`versions[${index}].drift disagrees with normalized findings`);
+              }
+              const shape = JSON.stringify({
+                version: entry.version,
+                missing: normalizedMissing.map((anchor) => anchor.id),
+                unmatched,
+              });
+              const digest = crypto.createHash("sha256").update(shape).digest("hex").slice(0, 12);
+              const tags = expectedEntryTags;
+              const body = [
+                `The OpenClaw system-prompt fingerprint used by this plugin no longer holds for \`openclaw@${entry.version}\` (npm \`${tags.join("`, `")}\`).`,
+                "",
+                "The plugin fails closed on this release: the identity sentence is left untouched.",
+                "",
+                `- **Checks run:** ${renderCoverage}`,
+                `- **npm dist-tags:** ${tags.join(", ")}`,
+                "",
+                "## Normalized drift facts",
+                "",
+              ];
+              for (const anchor of normalizedMissing) {
+                body.push(`- Missing anchor **${anchor.id}**: \`${anchor.literal}\``);
+                for (const candidate of anchor.nearest) {
+                  body.push(
+                    `  - Closest literal (${candidate.similarity}): \`${candidate.literal}\``,
+                  );
+                }
+              }
+              for (const mode of unmatched) {
+                body.push(`- Fingerprint rejected the **${mode}** real render.`);
+              }
+              body.push(
+                "",
+                "## Reproduce",
+                "",
+                `Run \`node scripts/check-upstream-fingerprint.mjs ${entry.version}\` from a built checkout.`,
+              );
+              normalizedVersions.push({
+                version: entry.version,
+                drift: recomputedDrift,
+                digest,
+                issueTitle:
+                  `OpenClaw ${entry.version}: system-prompt fingerprint no longer matches`,
+                issueBody: body.join("\n").slice(0, 12000),
+              });
             }
-            if (!report.versions.some((version) => version.drift)) {
-              fail("drift is true but no version is drifted");
+            if (seenVersions.size !== expectedTagsByVersion.size) {
+              fail("report version set does not match current latest/beta");
+            }
+            const recomputedReportDrift = normalizedVersions.some((entry) => entry.drift);
+            if (report.drift !== recomputedReportDrift) {
+              fail("report.drift disagrees with normalized findings");
+            }
+            if (!recomputedReportDrift) {
+              fail("publication was requested without normalized drift");
             }
 
             // Ensure the label exists before filtering on it, so the very first
@@ -194,7 +451,7 @@ jobs:
               per_page: 100,
             });
 
-            for (const version of report.versions.filter((entry) => entry.drift)) {
+            for (const version of normalizedVersions.filter((entry) => entry.drift)) {
               // Deduplication has two levels, because this runs every day.
               //
               //   versionMarker  one open issue per affected release, ever. This

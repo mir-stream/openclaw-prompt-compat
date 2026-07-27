@@ -1,0 +1,510 @@
+name: Upstream fingerprint watch
+
+# The plugin fails closed when the OpenClaw system-prompt structure changes: it
+# stops rewriting the identity sentence and says nothing. This job is the thing
+# that says something. It re-checks the fingerprint against the npm `latest` and
+# `beta` OpenClaw releases once a day, so a break is caught when the release
+# appears rather than when someone happens to look. The 2026.7.2 preamble
+# rewrite shipped in a beta on 07-15 and was found by hand on 07-27; watching
+# `beta` is what turns that 12 days into hours.
+#
+# Drift does not fail this workflow. A red X on a scheduled job is noise that
+# gets muted, and the signal we want is an issue with the broken anchor in it.
+# The check script exits non-zero only when the watch itself breaks — a network
+# failure, a corrupt tarball, a builder it cannot identify — because that means
+# nothing was actually checked, which is a different and worse event.
+
+on:
+  schedule:
+    # Daily at 05:23 UTC. Off the hour on purpose: scheduled jobs queued at :00
+    # are the ones GitHub delays most.
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-fingerprint-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      drift: ${{ steps.check.outputs.drift }}
+      drift_versions: ${{ steps.check.outputs.drift_versions }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The check reads the compiled fingerprint out of dist/index.js rather
+      # than restating the anchors, so the build has to happen first.
+      - name: Build
+        run: npm run build
+
+      - name: Check upstream fingerprint
+        id: check
+        run: |
+          node scripts/check-upstream-fingerprint.mjs \
+            --work-dir "${{ runner.temp }}/fingerprint-watch" \
+            --json "${{ runner.temp }}/fingerprint-report.json" \
+            --markdown "${{ runner.temp }}/fingerprint-report.md" \
+            --github-output
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fingerprint-report
+          path: |
+            ${{ runner.temp }}/fingerprint-report.json
+            ${{ runner.temp }}/fingerprint-report.md
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # "The check did not run" and "the check found nothing" must not read the
+      # same, or a broken watch looks like a healthy one. The Markdown report
+      # includes every watched version, including healthy and partial results.
+      - name: Summarize
+        if: always()
+        env:
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+          COMPLETED_TARGETS: ${{ steps.check.outputs.completed_targets }}
+          REPORT_MD: ${{ runner.temp }}/fingerprint-report.md
+        run: |
+          if [ "$CHECK_OUTCOME" != "success" ]; then
+            {
+              echo "### Fingerprint watch did not complete"
+              echo
+              echo "The check step ended as \`$CHECK_OUTCOME\`."
+              if [ -s "$REPORT_MD" ]; then
+                if [ "${COMPLETED_TARGETS:-0}" -gt 0 ]; then
+                  echo "Completed target coverage is retained below; failed targets remain unverified."
+                else
+                  echo "No target completed, so nothing was verified."
+                fi
+                echo
+                cat "$REPORT_MD"
+              else
+                echo "No target completed, so nothing was verified."
+              fi
+              echo
+              echo "This incomplete run is a failure of the watch, not a finding about upstream."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            cat "$REPORT_MD" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  publish:
+    needs: check
+    if: needs.check.result == 'success' && needs.check.outputs.drift == 'true'
+    permissions:
+      issues: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # This job intentionally performs no checkout and executes no upstream
+      # package code. Its only input from the unprivileged check job is a
+      # schema-validated JSON artifact.
+      - name: Download report
+        uses: actions/download-artifact@v4
+        with:
+          name: fingerprint-report
+          path: ${{ runner.temp }}/fingerprint-report
+
+      - name: Open or update drift issue
+        uses: actions/github-script@v7
+        env:
+          REPORT_PATH: ${{ runner.temp }}/fingerprint-report/fingerprint-report.json
+        with:
+          script: |
+            const crypto = require("node:crypto");
+            const { execFileSync } = require("node:child_process");
+            const fs = require("node:fs");
+            const reportBytes = fs.statSync(process.env.REPORT_PATH).size;
+            if (reportBytes > 1024 * 1024) {
+              throw new Error("Invalid fingerprint report: artifact exceeds 1 MiB");
+            }
+            const report = JSON.parse(fs.readFileSync(process.env.REPORT_PATH, "utf8"));
+            const LABEL = "upstream-drift";
+            const ANCHOR_IDS = new Set([
+              "identity",
+              "tooling",
+              "safety",
+              "workspace",
+              "workspaceFiles",
+              "cacheBoundary",
+              "runtime",
+            ]);
+            const RENDER_MODES = new Set(["default", "minimal"]);
+
+            const fail = (message) => {
+              throw new Error(`Invalid fingerprint report: ${message}`);
+            };
+            const plainText = (value, field, inputLimit = 1000, outputLimit = 300) => {
+              if (typeof value !== "string" || value.length > inputLimit) {
+                fail(`${field} must be a string of at most ${inputLimit} characters`);
+              }
+              return value
+                .replace(/[\u0000-\u001f\u007f]+/g, " ")
+                .replace(/\p{Cf}+/gu, " ")
+                .replace(/<!--/g, "&lt;!--")
+                .replace(/-->/g, "--&gt;")
+                .replace(/`/g, "&#96;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/\s+/g, " ")
+                .trim()
+                .slice(0, outputLimit);
+            };
+            const expectArray = (value, field, limit) => {
+              if (!Array.isArray(value) || value.length > limit) {
+                fail(`${field} must be an array with at most ${limit} entries`);
+              }
+              return value;
+            };
+            const expectObject = (value, field) => {
+              if (!value || typeof value !== "object" || Array.isArray(value)) {
+                fail(`${field} must be an object`);
+              }
+              return value;
+            };
+
+            let distTags;
+            try {
+              distTags = JSON.parse(
+                execFileSync("npm", ["view", "openclaw", "dist-tags", "--json"], {
+                  encoding: "utf8",
+                  timeout: 60000,
+                  maxBuffer: 1024 * 1024,
+                }),
+              );
+            } catch (error) {
+              throw new Error(`Cannot independently resolve OpenClaw dist-tags: ${error.message}`);
+            }
+            const versionPattern = /^[0-9A-Za-z][0-9A-Za-z.+-]{0,127}$/;
+            const expectedTagsByVersion = new Map();
+            for (const tag of ["latest", "beta"]) {
+              const version = distTags?.[tag];
+              if (typeof version !== "string" || !versionPattern.test(version)) {
+                throw new Error(`npm dist-tag ${tag} returned an invalid version`);
+              }
+              const tags = expectedTagsByVersion.get(version) ?? [];
+              tags.push(tag);
+              expectedTagsByVersion.set(version, tags);
+            }
+
+            if (!report || typeof report !== "object" || Array.isArray(report)) fail("root must be an object");
+            if (report.incomplete !== false) fail("incomplete must be false");
+            if (
+              !Array.isArray(report.watchedDistTags) ||
+              report.watchedDistTags.length !== 2 ||
+              report.watchedDistTags[0] !== "latest" ||
+              report.watchedDistTags[1] !== "beta"
+            ) {
+              fail("watchedDistTags must be exactly latest,beta");
+            }
+            if (
+              !Array.isArray(report.versions) ||
+              report.versions.length !== expectedTagsByVersion.size
+            ) {
+              fail("versions must exactly match the unique current latest/beta version set");
+            }
+
+            const seenVersions = new Set();
+            const normalizedVersions = [];
+            for (const [index, rawVersion] of report.versions.entries()) {
+              const entry = expectObject(rawVersion, `versions[${index}]`);
+              if (
+                typeof entry.version !== "string" ||
+                !expectedTagsByVersion.has(entry.version) ||
+                seenVersions.has(entry.version)
+              ) {
+                fail(`versions[${index}].version is unexpected or duplicated`);
+              }
+              seenVersions.add(entry.version);
+              const expectedEntryTags = expectedTagsByVersion.get(entry.version);
+              if (
+                !Array.isArray(entry.tags) ||
+                entry.tags.length !== expectedEntryTags.length ||
+                entry.tags.some((tag, tagIndex) => tag !== expectedEntryTags[tagIndex])
+              ) {
+                fail(`versions[${index}].tags do not match the current dist-tag mapping`);
+              }
+
+              const literalCheck = expectObject(
+                entry.literalCheck,
+                `versions[${index}].literalCheck`,
+              );
+              if (literalCheck.ran !== true) {
+                fail(`versions[${index}].literalCheck.ran must be true`);
+              }
+              const found = expectArray(
+                literalCheck.found,
+                `versions[${index}].literalCheck.found`,
+                ANCHOR_IDS.size,
+              );
+              const missing = expectArray(
+                literalCheck.missing,
+                `versions[${index}].literalCheck.missing`,
+                ANCHOR_IDS.size,
+              );
+              const seenAnchors = new Set();
+              for (const [foundIndex, rawFound] of found.entries()) {
+                const item = expectObject(
+                  rawFound,
+                  `versions[${index}].literalCheck.found[${foundIndex}]`,
+                );
+                if (!ANCHOR_IDS.has(item.id) || seenAnchors.has(item.id)) {
+                  fail(`versions[${index}] has an invalid or duplicate found anchor`);
+                }
+                seenAnchors.add(item.id);
+              }
+              const normalizedMissing = [];
+              for (const [missingIndex, rawMissing] of missing.entries()) {
+                const item = expectObject(
+                  rawMissing,
+                  `versions[${index}].literalCheck.missing[${missingIndex}]`,
+                );
+                if (!ANCHOR_IDS.has(item.id) || seenAnchors.has(item.id)) {
+                  fail(`versions[${index}] has an invalid or duplicate missing anchor`);
+                }
+                seenAnchors.add(item.id);
+                const nearest = expectArray(
+                  item.nearest,
+                  `versions[${index}].literalCheck.missing[${missingIndex}].nearest`,
+                  3,
+                ).map((rawNearest, nearestIndex) => {
+                  const candidate = expectObject(
+                    rawNearest,
+                    `versions[${index}].missing[${missingIndex}].nearest[${nearestIndex}]`,
+                  );
+                  if (
+                    typeof candidate.similarity !== "number" ||
+                    !Number.isFinite(candidate.similarity) ||
+                    candidate.similarity < 0 ||
+                    candidate.similarity > 1
+                  ) {
+                    fail(`versions[${index}] has an invalid nearest similarity`);
+                  }
+                  return {
+                    literal: plainText(
+                      candidate.literal,
+                      `versions[${index}].missing[${missingIndex}].nearest[${nearestIndex}].literal`,
+                      1000,
+                      300,
+                    ),
+                    similarity: candidate.similarity.toFixed(3),
+                  };
+                });
+                normalizedMissing.push({
+                  id: item.id,
+                  literal: plainText(
+                    item.literal,
+                    `versions[${index}].literalCheck.missing[${missingIndex}].literal`,
+                    1000,
+                    300,
+                  ),
+                  nearest,
+                });
+              }
+              if (seenAnchors.size !== ANCHOR_IDS.size) {
+                fail(`versions[${index}] must account for every monitored anchor exactly once`);
+              }
+
+              const renderCheck = expectObject(
+                entry.renderCheck,
+                `versions[${index}].renderCheck`,
+              );
+              if (typeof renderCheck.ran !== "boolean") {
+                fail(`versions[${index}].renderCheck.ran must be boolean`);
+              }
+              const unmatched = [];
+              let renderCoverage;
+              if (renderCheck.ran) {
+                const modes = expectObject(
+                  renderCheck.modes,
+                  `versions[${index}].renderCheck.modes`,
+                );
+                const modeNames = Object.keys(modes);
+                if (
+                  modeNames.length !== RENDER_MODES.size ||
+                  modeNames.some((mode) => !RENDER_MODES.has(mode))
+                ) {
+                  fail(`versions[${index}] must report exactly default and minimal render modes`);
+                }
+                for (const mode of [...RENDER_MODES]) {
+                  const modeResult = expectObject(
+                    modes[mode],
+                    `versions[${index}].renderCheck.modes.${mode}`,
+                  );
+                  if (typeof modeResult.matched !== "boolean") {
+                    fail(`versions[${index}].renderCheck.modes.${mode}.matched must be boolean`);
+                  }
+                  if (!modeResult.matched) unmatched.push(mode);
+                }
+                renderCoverage = "(A) anchor literals + (B) real render vs fingerprint";
+              } else {
+                const reason = plainText(
+                  renderCheck.reason,
+                  `versions[${index}].renderCheck.reason`,
+                  1000,
+                  300,
+                );
+                renderCoverage = `(A) anchor literals only — (B) not run: \`${reason}\``;
+              }
+
+              normalizedMissing.sort((left, right) => left.id.localeCompare(right.id));
+              unmatched.sort();
+              const recomputedDrift = normalizedMissing.length > 0 || unmatched.length > 0;
+              if (entry.drift !== recomputedDrift) {
+                fail(`versions[${index}].drift disagrees with normalized findings`);
+              }
+              const shape = JSON.stringify({
+                version: entry.version,
+                missing: normalizedMissing.map((anchor) => anchor.id),
+                unmatched,
+              });
+              const digest = crypto.createHash("sha256").update(shape).digest("hex").slice(0, 12);
+              const tags = expectedEntryTags;
+              const body = [
+                `The OpenClaw system-prompt fingerprint used by this plugin no longer holds for \`openclaw@${entry.version}\` (npm \`${tags.join("`, `")}\`).`,
+                "",
+                "The plugin fails closed on this release: the identity sentence is left untouched.",
+                "",
+                `- **Checks run:** ${renderCoverage}`,
+                `- **npm dist-tags:** ${tags.join(", ")}`,
+                "",
+                "## Normalized drift facts",
+                "",
+              ];
+              for (const anchor of normalizedMissing) {
+                body.push(`- Missing anchor **${anchor.id}**: \`${anchor.literal}\``);
+                for (const candidate of anchor.nearest) {
+                  body.push(
+                    `  - Closest literal (${candidate.similarity}): \`${candidate.literal}\``,
+                  );
+                }
+              }
+              for (const mode of unmatched) {
+                body.push(`- Fingerprint rejected the **${mode}** real render.`);
+              }
+              body.push(
+                "",
+                "## Reproduce",
+                "",
+                `Run \`node scripts/check-upstream-fingerprint.mjs ${entry.version}\` from a built checkout.`,
+              );
+              normalizedVersions.push({
+                version: entry.version,
+                drift: recomputedDrift,
+                digest,
+                issueTitle:
+                  `OpenClaw ${entry.version}: system-prompt fingerprint no longer matches`,
+                issueBody: body.join("\n").slice(0, 12000),
+              });
+            }
+            if (seenVersions.size !== expectedTagsByVersion.size) {
+              fail("report version set does not match current latest/beta");
+            }
+            const recomputedReportDrift = normalizedVersions.some((entry) => entry.drift);
+            if (report.drift !== recomputedReportDrift) {
+              fail("report.drift disagrees with normalized findings");
+            }
+            if (!recomputedReportDrift) {
+              fail("publication was requested without normalized drift");
+            }
+
+            // Ensure the label exists before filtering on it, so the very first
+            // drift does not depend on someone having created it by hand.
+            try {
+              await github.rest.issues.createLabel({
+                ...context.repo,
+                name: LABEL,
+                color: "B60205",
+                description: "The OpenClaw system-prompt fingerprint no longer matches an upstream release",
+              });
+            } catch (error) {
+              if (error.status !== 422) throw error; // 422 = already exists
+            }
+
+            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
+              ...context.repo,
+              state: "open",
+              labels: LABEL,
+              per_page: 100,
+            });
+
+            for (const version of normalizedVersions.filter((entry) => entry.drift)) {
+              // Deduplication has two levels, because this runs every day.
+              //
+              //   versionMarker  one open issue per affected release, ever. This
+              //                  is what stops a daily pile of identical issues.
+              //   digestMarker   identifies *which* anchors broke. An open issue
+              //                  is only commented on when the drift changes
+              //                  shape — a second anchor breaking in a later
+              //                  release of the same version is worth a comment;
+              //                  the same break seen again tomorrow is not.
+              //
+              // Both markers live in the issue body and in every comment, so the
+              // state this job needs is carried by the issue itself and no
+              // external storage or workflow state is involved.
+              const versionMarker = `<!-- upstream-fingerprint-watch version=${version.version} -->`;
+              const digestMarker = `<!-- upstream-fingerprint-watch digest=${version.digest} -->`;
+              const markers = `\n\n${versionMarker}\n${digestMarker}`;
+
+              const existing = openIssues.find(
+                (issue) => !issue.pull_request && (issue.body ?? "").includes(versionMarker),
+              );
+
+              if (!existing) {
+                const created = await github.rest.issues.create({
+                  ...context.repo,
+                  title: version.issueTitle,
+                  body: version.issueBody + markers,
+                  labels: [LABEL],
+                });
+                core.notice(`Opened #${created.data.number} for openclaw@${version.version}`);
+                continue;
+              }
+
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                ...context.repo,
+                issue_number: existing.number,
+                per_page: 100,
+              });
+              const alreadyReported =
+                (existing.body ?? "").includes(digestMarker) ||
+                comments.some((comment) => (comment.body ?? "").includes(digestMarker));
+
+              if (alreadyReported) {
+                core.info(
+                  `#${existing.number} already reports this exact drift for openclaw@${version.version}; nothing to do.`,
+                );
+                continue;
+              }
+
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: existing.number,
+                body: `The drift on \`openclaw@${version.version}\` changed shape.\n\n${version.issueBody}${markers}`,
+              });
+              core.notice(`Commented on #${existing.number} for openclaw@${version.version}`);
+            }

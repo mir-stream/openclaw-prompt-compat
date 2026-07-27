@@ -280,7 +280,156 @@ transform 등록·적용까지 포함한 wire 값을 본다.
 미실행으로 남은 검증은 다음과 같다. npm 게시, 게시본의 managed install·mock outbound acceptance,
 live provider turn, `2026.7.2` GA tarball에 대한 앵커·순서 재확인.
 
-## 6. `setup_openclaw` 통합 계약
+## 6. 업스트림 지문 감시
+
+지문이 깨지면 플러그인은 fail-closed로 무동작한다(§2). 안전하지만 조용하다. `2026.7.2`의 산문 축약은
+`2026.7.2-beta.1`(07-15)에 이미 들어 있었고, 사람이 손으로 확인한 07-27에야 발견됐다. 12일이 걸렸고
+`2026.7.2` CHANGELOG에는 해당 항목이 없으므로 릴리스 노트를 읽는 것으로는 감지되지 않는다
+([조사 문서](./2026-07-27-openclaw-2026.7.2-fingerprint-survey.md) §3).
+
+`.github/workflows/upstream-watch.yml`이 하루 한 번 검사한다. 대상은 npm `latest`와 `beta` 두 태그이고
+`alpha`는 보지 않는다. **`beta`를 함께 보는 것이 이 장치의 핵심이다.** 위 사고에서 알 수 있었던 가장
+이른 시점이 beta 게시일이었고, GA를 기다렸다면 이미 늦었다.
+
+검사기는 `scripts/check-upstream-fingerprint.mjs`다. Node에서 실행하며, 이미 devDependency인
+TypeScript parser를 (A)의 JavaScript 리터럴 판별에 사용한다.
+`package.json#files`에 `scripts`가 없으므로 npm 배포물에는 들어가지 않는다. 특정 버전을 인자로 주면
+로컬에서도 그대로 돌아간다.
+
+```sh
+npm run build
+node scripts/check-upstream-fingerprint.mjs                  # latest + beta
+node scripts/check-upstream-fingerprint.mjs 2026.7.1 2026.3.24
+```
+
+**검사기가 대조하는 지문은 언제나 그 시점 리포의 지문이다.** 앵커 리터럴도 정규식도 스크립트에 다시
+적지 않고 빌드된 `dist/index.js`의 export에서 읽는다 — (A)는 marker 상수
+(`TOOLING_SECTION_MARKER`·`SAFETY_SECTION_MARKER`·`WORKSPACE_SECTION_MARKER`·
+`WORKSPACE_FILES_SECTION_MARKER`·`SYSTEM_PROMPT_CACHE_BOUNDARY`·`RUNTIME_SECTION_MARKER`)를,
+(B)는 `OPENCLAW_SYSTEM_PROMPT_FINGERPRINT`를 그대로 쓴다. 스크립트에는 앵커의 **이름 목록**만 있고
+문자열 사본은 없다.
+
+따라서 지문이 앞으로 또 바뀌어도 감시기를 함께 고칠 필요가 없다. `0.3.0`이 산문 프리앰블을
+`## Safety`·`## Workspace`로 교체한 것 같은 변경은 빌드만 다시 하면 그대로 반영된다. 앵커가 추가·삭제·
+개명돼 이름 목록이 맞지 않게 되면 검사기는 조용히 통과하지 않고 **오류로 멈춘다.** 과거 커밋에서
+돌리면 그 커밋의 지문 기준으로 판정하므로, 지난 파손의 재현에도 그대로 쓸 수 있다(§6.1의 `0.2.0` 예).
+
+한 가지 한계는 물려받은 것이다. `src/index.ts`는 marker 상수를 선언하면서 같은 문자열을 정규식에도
+따로 적고 있고 둘 사이에 연결이 없다. 정규식만 고치면 (A)는 낡은 앵커를 검사하게 된다. 이때는 (B)가
+받아낸다 — (B)는 컴파일된 정규식 자체를 실제 렌더에 돌리므로 상수와 패턴이 어긋나면 "지문이 거부한
+실제 렌더"로 드러난다. 이 한계는 감시기가 만든 것이 아니고, 리터럴을 스크립트에 **세 번째로** 복사하는
+것은 해법이 아니다. 사본을 늘리면 어긋남이 더 안 보이게 될 뿐이다.
+
+이 의존 때문에 머지 순서가 정해진다. 감시기는 `0.3.0` 지문(`## Safety`·`## Workspace`)을 전제하므로
+그 지문을 담은 변경이 먼저 들어가야 한다. 감시 장치 브랜치(`feat/upstream-fingerprint-watch`)는 앵커
+교체 브랜치(`docs/openclaw-2026.7.2-fingerprint-survey`, PR #3) 위에 stack돼 있다. PR은 base를 후자로
+잡아야 diff가 깨끗하고, **PR #3이 먼저 머지돼야 한다.** `main`(`0.2.0`) 기준으로 감시기를 돌리면
+`2026.7.2-beta.4`가 정상적으로 drift로 잡힌다 — 그건 오탐이 아니라 `0.2.0` 지문의 실제 상태다(§6.1).
+
+### 6.1 두 층으로 검사한다
+
+강한 쪽이 못 돌아도 약한 쪽은 남도록, 바이트를 가져오는 방법부터 분리했다.
+
+| 층 | 방법 | 잡는 것 | 실행 조건 |
+| --- | --- | --- | --- |
+| (A) 앵커 리터럴 존재 | `npm pack` 후 TypeScript parser로 JavaScript string/template literal을 식별해 각 앵커를 찾는다. 코드 실행 없음 | 앵커의 삭제·개작 | 항상 |
+| (B) 실제 렌더 + 지문 대조 | 임시 디렉터리에 설치하고 빌더를 import해 렌더한 뒤 `OPENCLAW_SYSTEM_PROMPT_FINGERPRINT`를 돌린다 | 앵커는 다 있는데 **순서**만 바뀐 경우 | 가능할 때만 |
+
+`2026.7.2` 사고는 (A)만으로 잡힌다. 프리앰블 리터럴이 통째로 사라졌기 때문이다. 실제로 `0.2.0` 지문으로
+`2026.7.2-beta.4`를 검사하면 (A)가 다음을 보고한다.
+
+```text
+MISSING toolingPreamble "Available tools are policy-filtered. Names are case-sensitive; call exactly as listed."
+          closest literal (0.538): "Tools policy-filtered. Names case-sensitive; call exact."
+```
+
+앵커가 없어졌다는 사실만으로는 대응할 수 없으므로, 빌더의 문자열 리터럴 중 사라진 앵커와 가장 닮은
+것을 함께 제시한다. 위가 그 출력이고 §1의 before/after가 그대로 복원됐다.
+
+**(B)는 반드시 격리한다.** 빌더 import에는 부작용이 있을 수 있다. `2026.2.26`·`2026.3.24`는 빌더가
+monolithic CLI 번들 안에 있어 import만으로 `~/.openclaw`를 읽고 bootstrap을 돌린 뒤 throw한다
+(조사 문서 §8.1). 방어는 두 겹이다. 첫째, import할 export를 `export {}` 절에서 **정적으로** 고른다.
+프롬프트 빌더를 export하지 않는 번들은 애초에 import되지 않는다 — `2026.3.24`가 여기서 걸러진다.
+둘째, 실제로 일어나는 import는 `HOME`을 임시 디렉터리로 바꾼 자식 프로세스에서 타임아웃과 함께 돈다.
+content quorum에 맞는 파일·export가 여럿이면 한 후보의 import·render 실패로 멈추지 않고 모든 후보를
+검사한다. 사용 가능한 후보들의 default/minimal match 결과가 모두 같을 때만 결정적인 후보 하나를
+골라 성공으로 보고한다. 하나라도 결과가 다르면 archive/export 순서로 고르지 않고, 모호성 및 사용
+불가능한 후보 이유를 제한된 길이로 남긴 채 (B) 미실행으로 보고한다. 정적 후보 수가 실행 상한을
+넘는 파일도 일부를 건너뛰어 판정하지 않고 (B) 전체를 fail-closed한다.
+(B)의 설치가 시작되지 못하거나 timeout된 경우를 포함해, (B)가 못 돌면 "(A)만 수행됨"으로 보고하고
+**drift로 취급하지 않는다.** 돌지 못한 검사는 업스트림에 대해 아무것도 말해주지 않는다.
+
+콘솔·Markdown·Actions summary는 버전마다 어떤 검사가 실제로 돌았는지 항상 명시한다. (A)만 돌았으면
+"Layer A 통과(부분 검사)"라고 쓰며 전체 지문이 일치한다고 말하지 않는다.
+
+### 6.2 빌더 파일은 이름이 아니라 내용으로 찾는다
+
+빌더 파일명은 조사 기간 중 세 번 바뀌었다(조사 문서 §5.1). 따라서 특정 파일명이나 개별 앵커에
+의존하지 않고, 현행 앵커 리터럴 3개 이상(또는 2개와 정적으로 확인한 prompt-builder export)을 함께
+가진 파일을 찾는다. identity나 `## Tooling` 자체가 사라져도 나머지 앵커로 빌더를 찾아 정상적인
+drift로 보고하기 위한 조건이다. 이 quorum조차 없는 패키지만 빌더 식별 불가 오류로 취급한다.
+원문 substring gate를 두지 않는다. 크기 상한 안의 모든 JavaScript 파일을 한 번씩 parse해
+single/double/template literal segment만 index하므로 `\x23`·`\u0023`·`\u{23}` 같은 합법적 escape도
+해독하고, `//`·`/* */` 주석과 regex source에 남은 옛 앵커는 제외한다. 실제 string 안의 comment 모양
+텍스트와 escaped newline은 정상적인 literal content로 처리한다.
+
+캐시 경계 앵커에는 함정이 하나 더 있다. `2026.7.1`부터 `OPENCLAW_CACHE_BOUNDARY` 정의가
+`@openclaw/ai`로 옮겨가서 **openclaw tarball만 grep하면 0건이다**(조사 문서 §8.1). 그대로 두면 정상
+릴리스를 매일 drift로 신고한다. 그래서 앵커를 빌더 → 같은 패키지의 나머지 → 릴리스가 선언한
+`@openclaw/*` 의존성 순으로 찾고, **어디서 찾았는지를 함께 보고한다.** 이동은 이동으로 읽혀야 한다.
+
+```text
+ok  cacheBoundary "<!-- OPENCLAW_CACHE_BOUNDARY -->"  <- @openclaw/ai@2026.7.1:dist/transform-messages-BhGF_fF4.mjs
+```
+
+### 6.3 drift는 실패가 아니다
+
+워크플로는 drift를 발견해도 **exit 0으로 끝난다.** 스케줄 잡의 빨간 X는 결국 무시되고, 우리가 원하는
+신호는 깨진 앵커가 적힌 이슈다. 반대로 **검사기 자체가 고장나면 exit 1로 실패한다** — 네트워크 실패,
+tarball 손상, 빌더 식별 불가. 이때는 아무것도 검사되지 않은 것이므로 drift와는 다른, 더 나쁜 사건이다.
+step summary도 "검사가 안 돌았다"와 "검사했는데 문제 없다"를 다르게 쓴다.
+한 target이 실패해도 나머지 target 검사는 계속한다. 완료된 target과 실패한 target/error를 콘솔·JSON·
+Markdown에 모두 남긴 뒤 전체 실행은 exit 1로 끝난다. 따라서 부분 성공의 증거는 보존되지만 publish
+job은 실행되지 않는다.
+
+권한 경계도 두 job으로 나뉜다. `check` job은 `contents: read`만 갖고 checkout credential을 남기지
+않은 채 (A)/(B)를 실행해 리포트 artifact를 만든다. `issues: write`는 별도 runner의 `publish` job만
+가지며, 이 job은 checkout이나 OpenClaw import를 하지 않는다. artifact의 모든 바이트는 신뢰하지
+않는다. publish job이 npm `latest`·`beta`를 독립적으로 다시 조회해 정확한 버전 집합을 요구하고,
+허용된 앵커 id와 render mode만 정규화한다. artifact의 title/body/digest는 버리고, 제한된 plain-text
+finding에서 본문과 digest를 다시 만든 뒤 이슈 API를 호출한다. 두 조회 사이 tag가 바뀌어도 mismatch로
+fail-closed한다. (B) 미실행 이유는 format/bidi control까지 제거한 뒤 inline code로만 넣어 링크·mention·
+강조 문법이 활성화되지 않게 한다. 같은 schedule/manual 실행이 겹쳐 중복 이슈를 만들지 않도록 workflow 전용
+concurrency group도 직렬화한다.
+
+drift가 있으면 `upstream-drift` 라벨로 이슈를 연다. 매일 도는 잡이므로 중복 방지가 필수다. 이슈 본문에
+두 개의 HTML 주석 마커를 심어 상태를 이슈 자체에 보관한다. 외부 저장소도 workflow state도 쓰지 않는다.
+
+| 마커 | 역할 |
+| --- | --- |
+| `version=<버전>` | 버전당 열린 이슈는 하나뿐이다. 같은 이슈가 매일 쌓이는 것을 막는다 |
+| `digest=<해시>` | **어떤** 앵커가 깨졌는지를 식별한다. drift의 형태가 바뀔 때만 코멘트를 단다 |
+
+digest는 누락된 앵커 id 집합과 match에 실패한 렌더 모드로 계산한다. 내일 같은 파손을 또 봐도 조용하고,
+같은 버전에서 앵커가 하나 더 깨지면 그때 코멘트가 붙는다.
+
+이슈 본문에는 버전, 실제로 돌아간 검사, 빌더 파일, 깨진 앵커의 before/after, 아직 살아있는 앵커 목록,
+재현 명령이 들어간다. "지문이 깨졌다"만 있는 이슈는 쓸모가 없다.
+
+### 6.4 이 장치가 덮지 않는 것
+
+업스트림 감시는 **릴리스를 보는 것이지 사용자 환경을 보는 것이 아니다.** npm에 올라온 tarball에 대해
+지문이 유효한지 판정할 뿐, 실제 설치본에서 치환이 일어났는지는 관측하지 않는다. 다음은 이 장치로
+잡히지 않는다.
+
+- 감시 대상이 아닌 버전(`alpha`, 고정된 구버전)을 쓰는 설치본
+- 프롬프트 구조가 host 설정·provider override로 런타임에 달라지는 경우
+- 지문은 유효한데 플러그인이 load되지 않았거나 disable된 경우
+
+플러그인 내부에서 치환 실패를 관측하는 경로는 여전히 미해결이다. `registerTextTransforms`는 등록 시점
+API이고 match 실패는 런타임 문자열마다 발생하므로 별도 설계가 필요하다(§2, 조사 문서 §10.2·§10.3).
+
+## 7. `setup_openclaw` 통합 계약
 
 `mir-stream/rota-crew`의 `setup_openclaw`는 다음과 같이 맞춘다.
 
@@ -305,7 +454,7 @@ npm package가 게시되기 전에는 이 setup 변경을 공개 배포하지 �
 `identitySentence`를 setup이 함께 설정한다면 순서가 중요하다. strict config schema는 해당 키를
 선언한 버전이 설치되기 전에는 값을 거부하므로, `0.2.0` 이상 설치를 끝낸 뒤 config를 기록한다.
 
-## 7. 롤백
+## 8. 롤백
 
 운영 롤백은 독립 플러그인만 disable하고 Gateway를 재시작한다.
 
@@ -323,7 +472,7 @@ openclaw plugins uninstall openclaw-prompt-compat
 setup 재실행은 명시적 disable을 보존한다. 완전 제거 후 setup을 다시 실행하면 관리 대상이 없다고 판단해
 플러그인을 새로 설치하므로, 장기 opt-out은 uninstall이 아니라 disable로 표현한다.
 
-## 8. 완료 조건
+## 9. 완료 조건
 
 - [x] 독립 plugin source·manifest·build·CI가 구현됐다.
 - [x] 단위 테스트와 package dry-run이 통과했다.
@@ -337,13 +486,15 @@ setup 재실행은 명시적 disable을 보존한다. 완전 제거 후 setup을
 - [x] `0.2.0` 게시본으로 managed install과 mock outbound acceptance를 재실행한다.
 - [x] `0.2.0` 게시본으로 live provider turn을 재확인한다.
 - [x] 지문에서 산문 앵커를 제거하고 구조 앵커로 교체한다.
+- [x] 업스트림 릴리스에 대한 지문 감시를 자동화한다(§6). 사용자 환경에서의 치환 실패 관측은 별건이고
+      여전히 미해결이다(§6.4).
 - [ ] `@mir-stream/openclaw-prompt-compat@0.3.0`을 npm에 게시한다.
 - [ ] `0.3.0` 게시본으로 managed install과 mock outbound acceptance를 실행한다.
 - [ ] `0.3.0` 게시본으로 live provider turn을 확인한다.
 - [ ] `2026.7.2` GA tarball로 앵커·순서를 재확인한다.
 - [ ] `setup_openclaw` 변경을 배포하고 새 설치·재실행·disable 보존을 확인한다.
 
-## 9. 검토 근거
+## 10. 검토 근거
 
 - [OpenClaw `v2026.7.1` system prompt 생성 코드](https://github.com/openclaw/openclaw/blob/v2026.7.1/src/agents/system-prompt.ts)
 - [`registerTextTransforms`와 재귀 message 변환](https://github.com/openclaw/openclaw/blob/v2026.7.1/src/agents/plugin-text-transforms.ts)

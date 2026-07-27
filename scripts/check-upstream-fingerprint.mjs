@@ -1310,8 +1310,10 @@ function renderIssueBody(result) {
         lines.push("");
       }
       lines.push(
-        "Every anchor above was found as a literal, so this is an ordering or " +
-          "rendering-condition change rather than a removed anchor.",
+        result.literalCheck.missing.length > 0
+          ? "This release has both missing source literals and a real render that the fingerprint rejected."
+          : "Every anchor above was found as a literal, so this is an ordering or " +
+              "rendering-condition change rather than a removed anchor.",
       );
       lines.push("");
     }

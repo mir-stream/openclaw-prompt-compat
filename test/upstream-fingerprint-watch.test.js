@@ -334,13 +334,36 @@ test("keeps a missing source literal as drift when real rendering is unavailable
 });
 
 test("keeps a missing source literal as drift when one real render mismatches", () => {
+  const literalCheck = missingIdentityLiteralCheck();
+  const checkedRender = renderCheck(true, false);
   const classified = classifyFingerprintFindings(
-    missingIdentityLiteralCheck(),
-    renderCheck(true, false),
+    literalCheck,
+    checkedRender,
   );
   assert.equal(classified.sourceLayoutDiagnostics.length, 0);
   assert.match(classified.driftReasons.join("\n"), /identity.*not present as a string literal/);
   assert.match(classified.driftReasons.join("\n"), /real minimal render/);
+
+  const markdown = renderMarkdownReport([
+    {
+      version: "2026.7.2",
+      tags: ["latest"],
+      builderFiles: ["dist/system-prompt.js"],
+      literalCheck: {
+        ...literalCheck,
+        found: literalCheck.found.map((anchor) => ({ ...anchor, location: "builder" })),
+      },
+      renderCheck: checkedRender,
+      drift: true,
+      driftReasons: classified.driftReasons,
+      sourceLayoutDiagnostics: [],
+    },
+  ]);
+  assert.match(markdown, /## Anchors no longer present/);
+  assert.match(markdown, /## Renders the fingerprint rejected/);
+  assert.match(markdown, /both missing source literals and a real render/);
+  assert.doesNotMatch(markdown, /Every anchor above was found as a literal/);
+  assert.doesNotMatch(markdown, /rather than a removed anchor/);
 });
 
 test("turns npm install spawn failures into a render-not-run result", () => {

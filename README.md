@@ -9,8 +9,87 @@ You are a personal assistant running inside OpenClaw.
 You are a personal assistant running within OpenClaw.
 ```
 
-The plugin is provider- and model-independent. It has no configuration and no
-runtime dependencies.
+The replacement sentence is configurable; the sentence and structure it matches
+are not. The plugin is provider- and model-independent and has no runtime
+dependencies.
+
+## Configuration
+
+The plugin exposes one setting, `identitySentence`: the sentence written in
+place of the matched OpenClaw identity. The plugin makes no assumptions about
+the role — use any sentence that fits your deployment.
+
+Config path:
+
+```text
+plugins.entries.openclaw-prompt-compat.config.identitySentence
+```
+
+### Set it non-interactively
+
+Install `0.2.0` (or later) first — the setting is rejected by the strict config
+schema until the version that declares it is installed. Then write the value and
+restart the Gateway:
+
+```sh
+openclaw config set \
+  "plugins.entries.openclaw-prompt-compat.config.identitySentence" \
+  "You are the assistant for the Acme support desk."
+
+openclaw gateway restart
+```
+
+The example sentence is illustrative only; substitute your own.
+
+In a setup script, prefer batch mode — unlike value mode, it validates the
+write against the schema, so an unknown key or an uninstalled version fails
+loudly instead of writing silently:
+
+```sh
+openclaw config set --batch-file ./identity.batch.json
+```
+
+```json
+[
+  {
+    "path": "plugins.entries.openclaw-prompt-compat.config.identitySentence",
+    "value": "You are the assistant for the Acme support desk."
+  }
+]
+```
+
+Confirm the stored value with
+`openclaw config get "plugins.entries.openclaw-prompt-compat.config.identitySentence"`.
+
+### Equivalent config-file form
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "openclaw-prompt-compat": {
+        "config": {
+          "identitySentence": "You are the assistant for the Acme support desk."
+        }
+      }
+    }
+  }
+}
+```
+
+### Behavior
+
+- Default: `You are a personal assistant running within OpenClaw.` An install
+  with no `config` behaves exactly as it did before this setting existed.
+- Maximum length: 2000 characters, after trimming surrounding whitespace.
+- Multiple lines are allowed. The prompt continues with `## Tooling` on its own
+  line, so extra lines do not disturb the surrounding structure.
+- A non-string, empty, whitespace-only, or over-long value logs a warning and
+  falls back to the default rather than silently doing nothing. A value that
+  repeats the original identity sentence is used as given, with a warning that
+  it defeats the rewrite.
+- Changing the value takes effect only after a Gateway restart — the rewrite is
+  registered once at plugin startup.
 
 ## How it is scoped
 
@@ -40,7 +119,7 @@ immediately followed by `## Runtime`.
 
 ## Compatibility
 
-- Package: `@mir-stream/openclaw-prompt-compat@0.1.0`
+- Package: `@mir-stream/openclaw-prompt-compat@0.2.0`
 - Plugin id: `openclaw-prompt-compat`
 - OpenClaw host: `>=2026.7.1`
 - OpenClaw plugin API: `>=2026.7.1`
@@ -56,7 +135,7 @@ Install and pin the published version:
 
 ```sh
 openclaw plugins install \
-  "npm:@mir-stream/openclaw-prompt-compat@0.1.0" \
+  "npm:@mir-stream/openclaw-prompt-compat@0.2.0" \
   --pin
 ```
 
@@ -104,6 +183,11 @@ copies the exact identity, fixed 2026.7.1 Tooling preamble, and later structural
 markers can also match and have its first identity sentence changed. Strict
 system-prompt-only behavior requires a dedicated upstream OpenClaw transform
 surface.
+
+Because `identitySentence` is user-authored text, that text is what gets written
+wherever the fingerprint matches — not only in system prompts. Treat a
+configured sentence as content that may surface in any matching string, and keep
+it free of secrets.
 
 ## Development
 

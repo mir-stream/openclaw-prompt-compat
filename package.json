@@ -1,6 +1,6 @@
 {
   "name": "@mir-stream/openclaw-prompt-compat",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Fingerprint-scoped OpenClaw system-prompt identity compatibility transform with a configurable identity sentence.",
   "type": "module",
   "license": "MIT",

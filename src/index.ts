@@ -3,7 +3,8 @@
  *
  * The replacement changes only the identity sentence. Atomic-lookahead
  * captures and backreferences fingerprint the ordered OpenClaw system-prompt
- * structure without consuming or rewriting the rest of the prompt.
+ * structure — section headings and internal markers only, never prose —
+ * without consuming or rewriting the rest of the prompt.
  *
  * The fingerprint is fixed. Only the replacement sentence is configurable, so
  * user configuration can never widen what this plugin matches.
@@ -31,36 +32,57 @@ export const COMPATIBLE_IDENTITY_SENTENCE = DEFAULT_IDENTITY_SENTENCE;
 /** Mirrors `configSchema.properties.identitySentence.maxLength` in the manifest. */
 export const MAX_IDENTITY_SENTENCE_LENGTH = 2000;
 
+/** Declared in the order OpenClaw renders them. */
 export const TOOLING_SECTION_MARKER = "\n## Tooling\n";
-export const TOOLING_SECTION_PREAMBLE =
-  "Available tools are policy-filtered. Names are case-sensitive; call exactly as listed.";
+export const SAFETY_SECTION_MARKER = "\n## Safety\n";
+export const WORKSPACE_SECTION_MARKER = "\n## Workspace\n";
 export const WORKSPACE_FILES_SECTION_MARKER = "\n## Workspace Files (injected)\n";
 export const SYSTEM_PROMPT_CACHE_BOUNDARY = "\n<!-- OPENCLAW_CACHE_BOUNDARY -->\n";
 export const RUNTIME_SECTION_MARKER = "\n## Runtime\n";
 
 /**
- * OpenClaw 2026.7.1's core prompt starts with the identity sentence. Requiring
- * that absolute root prevents arbitrary or hook-prepended text from borrowing
- * the real prompt's later markers. Each marker segment is captured in an
- * atomic lookahead and consumed by backreference, keeping adversarial failure
- * paths linear while leaving the matched span limited to the identity.
+ * The OpenClaw core prompt starts with the identity sentence. Requiring that
+ * absolute root prevents arbitrary or hook-prepended text from borrowing the
+ * real prompt's later markers. Each marker segment is captured in an atomic
+ * lookahead and consumed by backreference, keeping adversarial failure paths
+ * linear while leaving the matched span limited to the identity.
+ *
+ * Every anchor is a structural heading or marker. Prose was measured to be an
+ * unstable anchor — descriptive sentences are rewritten release to release,
+ * while the five headings and their order held across all 11 sampled OpenClaw
+ * releases from 2026.2.26 through 2026.7.2-beta.4. The cache boundary is the
+ * one exception: it was introduced in 2026.4.15 and has been unchanged since,
+ * so it is the reason rendered prompts match no further back than that
+ * release. Every anchor renders unconditionally in the releases that have it,
+ * including under `promptMode: "minimal"`.
  *
  * The regex is non-global and non-sticky, so repeated calls are stateless and
  * at most one identity sentence is changed per input string.
  */
 const ORIGINAL_IDENTITY_PATTERN =
   "You are a personal assistant running inside OpenClaw\\.";
-const TOOLING_SECTION_PREAMBLE_PATTERN =
-  "Available tools are policy-filtered\\. Names are case-sensitive; call exactly as listed\\.";
+
+/**
+ * A marker segment: everything up to the next line that starts with `marker`.
+ * The trailing `\n` keeps `## Workspace` from being satisfied by the later
+ * `## Workspace Files (injected)` line it prefixes.
+ *
+ * `marker` is a regex fragment, not a literal — escaping is the caller's
+ * responsibility. An anchor containing `.`, `(`, or any other metacharacter
+ * would silently widen the pattern if passed unescaped.
+ */
+const markerSegment = (marker: string) =>
+  `(?=([\\s\\S]*?(?<![^\\n])${marker}\\n))`;
 
 export const OPENCLAW_SYSTEM_PROMPT_FINGERPRINT =
   new RegExp(
     `^${ORIGINAL_IDENTITY_PATTERN}(?=` +
       "\\n## Tooling\\n" +
-      `${TOOLING_SECTION_PREAMBLE_PATTERN}\\n` +
-      "(?=([\\s\\S]*?(?<![^\\n])## Workspace Files \\(injected\\)\\n))\\1" +
-      "(?=([\\s\\S]*?(?<![^\\n])<!-- OPENCLAW_CACHE_BOUNDARY -->\\n))\\2" +
-      "(?=([\\s\\S]*?(?<![^\\n])## Runtime\\n))\\3" +
+      markerSegment("## Safety") + "\\1" +
+      markerSegment("## Workspace") + "\\2" +
+      markerSegment("## Workspace Files \\(injected\\)") + "\\3" +
+      markerSegment("<!-- OPENCLAW_CACHE_BOUNDARY -->") + "\\4" +
+      markerSegment("## Runtime") + "\\5" +
       ")",
   );
 
@@ -68,7 +90,7 @@ export const OPENCLAW_SYSTEM_PROMPT_FINGERPRINT =
  * Escapes a sentence for use as a `String.prototype.replace` replacement.
  *
  * A replacement string treats `$$`, `$&`, `` $` ``, `$'`, and `$1`-`$9` as
- * substitution sequences, and the fingerprint above has three capture groups.
+ * substitution sequences, and the fingerprint above has five capture groups.
  * A configured sentence containing `$` would otherwise splice captured prompt
  * body text into the output or lose characters. The replacer callback returns
  * its value literally, so `$` becomes exactly `$$`.

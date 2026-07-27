@@ -95,15 +95,22 @@ Confirm the stored value with
 
 The plugin registers one input-only text replacement with
 `api.registerTextTransforms`. The non-global regular expression changes only
-the exact identity sentence at the absolute string start and only when the same
-string also contains this ordered fingerprint:
+the exact identity sentence at the absolute string start, and only when that
+string carries this ordered structural fingerprint:
 
-1. `## Tooling` immediately after the identity sentence
-2. OpenClaw 2026.7.1's fixed Tooling preamble immediately after that heading:
-   `Available tools are policy-filtered. Names are case-sensitive; call exactly as listed.`
-3. `## Workspace Files (injected)` later in the string
-4. OpenClaw's internal `<!-- OPENCLAW_CACHE_BOUNDARY -->` marker later still
-5. `## Runtime` after the cache boundary
+1. The exact identity sentence at the absolute string start
+2. `## Tooling` immediately after the identity sentence
+3. `## Safety` later in the string
+4. `## Workspace` after that, on a line of its own — the
+   `## Workspace Files (injected)` line it prefixes does not satisfy it
+5. `## Workspace Files (injected)` after that
+6. OpenClaw's internal `<!-- OPENCLAW_CACHE_BOUNDARY -->` marker later still
+7. `## Runtime` after the cache boundary
+
+Apart from the identity sentence itself, every anchor is a section heading or
+an internal marker. Prompt prose is deliberately excluded: descriptive
+sentences are rewritten from release to release, while these headings and their
+order have held.
 
 The core prompt must start at the absolute string start. Arbitrary or
 hook-prepended system context before the core prompt, an inline copy, changed
@@ -119,15 +126,24 @@ immediately followed by `## Runtime`.
 
 ## Compatibility
 
-- Package: `@mir-stream/openclaw-prompt-compat@0.2.0`
+- Package: `@mir-stream/openclaw-prompt-compat@0.3.0`
 - Plugin id: `openclaw-prompt-compat`
 - OpenClaw host: `>=2026.7.1`
 - OpenClaw plugin API: `>=2026.7.1`
 - Node.js: `>=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0`
 
-The fingerprint is intentionally tied to the OpenClaw `2026.7.1` prompt
-structure. Future OpenClaw prompt changes fail closed: if the required
-structure is absent or reordered, this plugin makes no replacement.
+The fingerprint uses only structural headings and markers — no prompt prose.
+`## Tooling`, `## Safety`, `## Workspace`, `## Workspace Files (injected)`, and
+`## Runtime` were present and in order in all 11 sampled OpenClaw releases from
+`2026.2.26` through `2026.7.2-beta.4`; the `<!-- OPENCLAW_CACHE_BOUNDARY -->`
+marker was introduced in `2026.4.15` and has not changed since. Rendered
+prompts from `2026.4.15` through `2026.7.2-beta.4` all match.
+
+That match range is not a support range. The supported host floor stays
+`>=2026.7.1`; the fingerprint simply happens to match further back.
+
+The fingerprint remains a structural dependency and fails closed: if the
+required structure is absent or reordered, this plugin makes no replacement.
 
 ## Install
 
@@ -135,7 +151,7 @@ Install and pin the published version:
 
 ```sh
 openclaw plugins install \
-  "npm:@mir-stream/openclaw-prompt-compat@0.2.0" \
+  "npm:@mir-stream/openclaw-prompt-compat@0.3.0" \
   --pin
 ```
 
@@ -179,8 +195,9 @@ history, and string values inside tool-call arguments.
 The structural fingerprint makes ordinary collisions—including a standalone
 identity sentence or a generic identity-plus-Tooling quote—very unlikely. It is
 not a security boundary. A user, tool result, or history entry that deliberately
-copies the exact identity, fixed 2026.7.1 Tooling preamble, and later structural
-markers can also match and have its first identity sentence changed. Strict
+copies the exact identity sentence at its start and then all of the ordered
+structural headings and markers can also match and have its first identity
+sentence changed. Strict
 system-prompt-only behavior requires a dedicated upstream OpenClaw transform
 surface.
 

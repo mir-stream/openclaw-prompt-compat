@@ -1,0 +1,186 @@
+name: Upstream fingerprint watch
+
+# The plugin fails closed when the OpenClaw system-prompt structure changes: it
+# stops rewriting the identity sentence and says nothing. This job is the thing
+# that says something. It re-checks the fingerprint against the npm `latest` and
+# `beta` OpenClaw releases once a day, so a break is caught when the release
+# appears rather than when someone happens to look. The 2026.7.2 preamble
+# rewrite shipped in a beta on 07-15 and was found by hand on 07-27; watching
+# `beta` is what turns that 12 days into hours.
+#
+# Drift does not fail this workflow. A red X on a scheduled job is noise that
+# gets muted, and the signal we want is an issue with the broken anchor in it.
+# The check script exits non-zero only when the watch itself breaks — a network
+# failure, a corrupt tarball, a builder it cannot identify — because that means
+# nothing was actually checked, which is a different and worse event.
+
+on:
+  schedule:
+    # Daily at 05:23 UTC. Off the hour on purpose: scheduled jobs queued at :00
+    # are the ones GitHub delays most.
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The check reads the compiled fingerprint out of dist/index.js rather
+      # than restating the anchors, so the build has to happen first.
+      - name: Build
+        run: npm run build
+
+      - name: Check upstream fingerprint
+        id: check
+        run: |
+          node scripts/check-upstream-fingerprint.mjs \
+            --work-dir "${{ runner.temp }}/fingerprint-watch" \
+            --json "${{ runner.temp }}/fingerprint-report.json" \
+            --markdown "${{ runner.temp }}/fingerprint-report.md" \
+            --github-output
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fingerprint-report
+          path: |
+            ${{ runner.temp }}/fingerprint-report.json
+            ${{ runner.temp }}/fingerprint-report.md
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Open or update drift issue
+        if: steps.check.outputs.drift == 'true'
+        uses: actions/github-script@v7
+        env:
+          REPORT_PATH: ${{ runner.temp }}/fingerprint-report.json
+        with:
+          script: |
+            const fs = require("node:fs");
+            const report = JSON.parse(fs.readFileSync(process.env.REPORT_PATH, "utf8"));
+            const LABEL = "upstream-drift";
+
+            // Ensure the label exists before filtering on it, so the very first
+            // drift does not depend on someone having created it by hand.
+            try {
+              await github.rest.issues.createLabel({
+                ...context.repo,
+                name: LABEL,
+                color: "B60205",
+                description: "The OpenClaw system-prompt fingerprint no longer matches an upstream release",
+              });
+            } catch (error) {
+              if (error.status !== 422) throw error; // 422 = already exists
+            }
+
+            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
+              ...context.repo,
+              state: "open",
+              labels: LABEL,
+              per_page: 100,
+            });
+
+            for (const version of report.versions.filter((entry) => entry.drift)) {
+              // Deduplication has two levels, because this runs every day.
+              //
+              //   versionMarker  one open issue per affected release, ever. This
+              //                  is what stops a daily pile of identical issues.
+              //   digestMarker   identifies *which* anchors broke. An open issue
+              //                  is only commented on when the drift changes
+              //                  shape — a second anchor breaking in a later
+              //                  release of the same version is worth a comment;
+              //                  the same break seen again tomorrow is not.
+              //
+              // Both markers live in the issue body and in every comment, so the
+              // state this job needs is carried by the issue itself and no
+              // external storage or workflow state is involved.
+              const versionMarker = `<!-- upstream-fingerprint-watch version=${version.version} -->`;
+              const digestMarker = `<!-- upstream-fingerprint-watch digest=${version.digest} -->`;
+              const markers = `\n\n${versionMarker}\n${digestMarker}`;
+
+              const existing = openIssues.find(
+                (issue) => !issue.pull_request && (issue.body ?? "").includes(versionMarker),
+              );
+
+              if (!existing) {
+                const created = await github.rest.issues.create({
+                  ...context.repo,
+                  title: version.issueTitle,
+                  body: version.issueBody + markers,
+                  labels: [LABEL],
+                });
+                core.notice(`Opened #${created.data.number} for openclaw@${version.version}`);
+                continue;
+              }
+
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                ...context.repo,
+                issue_number: existing.number,
+                per_page: 100,
+              });
+              const alreadyReported =
+                (existing.body ?? "").includes(digestMarker) ||
+                comments.some((comment) => (comment.body ?? "").includes(digestMarker));
+
+              if (alreadyReported) {
+                core.info(
+                  `#${existing.number} already reports this exact drift for openclaw@${version.version}; nothing to do.`,
+                );
+                continue;
+              }
+
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: existing.number,
+                body: `The drift on \`openclaw@${version.version}\` changed shape.\n\n${version.issueBody}${markers}`,
+              });
+              core.notice(`Commented on #${existing.number} for openclaw@${version.version}`);
+            }
+
+      # "The check did not run" and "the check found nothing" must not read the
+      # same, or a broken watch looks like a healthy one.
+      - name: Summarize
+        if: always()
+        env:
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+          DRIFT: ${{ steps.check.outputs.drift }}
+          DRIFT_VERSIONS: ${{ steps.check.outputs.drift_versions }}
+          REPORT_MD: ${{ runner.temp }}/fingerprint-report.md
+        run: |
+          if [ "$CHECK_OUTCOME" != "success" ]; then
+            {
+              echo "### Fingerprint watch did not complete"
+              echo
+              echo "The check step ended as \`$CHECK_OUTCOME\`, so nothing was verified."
+              echo "This is a failure of the watch, not a finding about upstream."
+            } >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$DRIFT" = "true" ]; then
+            {
+              echo "### Fingerprint drift detected"
+              echo
+              echo "Affected: \`$DRIFT_VERSIONS\`"
+              echo
+              cat "$REPORT_MD"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "The fingerprint still matches every watched OpenClaw release." >> "$GITHUB_STEP_SUMMARY"
+          fi

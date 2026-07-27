@@ -99,6 +99,10 @@ const BUILDER_EXPORT_PATTERN = /^build[A-Za-z]*AgentSystemPrompt$/;
 /** Rendering must not be able to hang the watch. */
 const RENDER_TIMEOUT_MS = 120_000;
 
+/** Bound ambiguous/malicious export sets and probe payload work. */
+const MAX_RENDER_CANDIDATES = 8;
+const MAX_RENDERED_PROMPT_BYTES = 8 * 1024 * 1024;
+
 /** `npm install` of a full OpenClaw release is not fast, but it is bounded. */
 const INSTALL_TIMEOUT_MS = 600_000;
 
@@ -617,28 +621,48 @@ function emit(payload) {
 
 try {
   const mod = await import(pathToFileURL(builderPath).href);
+  const usableCandidates = [];
+  const failures = [];
   for (const { alias, original } of candidates) {
     const fn = mod[alias];
-    if (typeof fn !== "function") continue;
+    if (typeof fn !== "function") {
+      if (failures.length < ${MAX_RENDER_CANDIDATES}) {
+        failures.push({ builderExport: original, reason: "export is not a function" });
+      }
+      continue;
+    }
     const renders = {};
     let usable = true;
+    let failureReason = "builder did not produce both prompt modes";
     for (const [mode, params] of [
       ["default", { workspaceDir }],
       ["minimal", { workspaceDir, promptMode: "minimal" }],
     ]) {
       try {
         const rendered = await fn(params);
-        if (typeof rendered !== "string" || rendered.length === 0) { usable = false; break; }
+        if (typeof rendered !== "string" || rendered.length === 0) {
+          usable = false;
+          failureReason = mode + " render was not a prompt string";
+          break;
+        }
         renders[mode] = rendered;
       } catch (error) {
         usable = false;
-        renders[mode + "Error"] = String(error && error.message).slice(0, 400);
+        failureReason = mode + " render failed: " + String(error && error.message).slice(0, 300);
         break;
       }
     }
-    if (usable) { emit({ ok: true, builderExport: original, renders }); process.exit(0); }
+    if (usable) {
+      usableCandidates.push({ builderExport: original, renders });
+    } else if (failures.length < ${MAX_RENDER_CANDIDATES}) {
+      failures.push({ builderExport: original, reason: failureReason });
+    }
   }
-  emit({ ok: false, reason: "no exported builder produced a prompt string" });
+  if (usableCandidates.length > 0) {
+    emit({ ok: true, candidates: usableCandidates, failures });
+  } else {
+    emit({ ok: false, reason: "no exported builder produced a prompt string", failures });
+  }
   process.exit(0);
 } catch (error) {
   emit({ ok: false, reason: "import failed: " + String(error && error.message).slice(0, 400) });
@@ -723,11 +747,29 @@ function checkRenderedFingerprint({
     const name = path.relative(installedRoot, builder.file);
     failures.push(`${name}: ${String(reason).replace(/\s+/g, " ").slice(0, 300)}`);
   };
+  if (builders.length > MAX_RENDER_CANDIDATES) {
+    return {
+      ran: false,
+      reason:
+        `builder discovery returned ${builders.length} candidates, exceeding the ` +
+        `${MAX_RENDER_CANDIDATES}-candidate render limit`,
+    };
+  }
+  const usableCandidates = [];
+  let candidateSetLimitExceeded = false;
 
   for (const builder of builders) {
     const candidates = findBuilderExports(builder.source);
     if (candidates.length === 0) {
       recordFailure(builder, `no export matched ${BUILDER_EXPORT_PATTERN}`);
+      continue;
+    }
+    if (candidates.length > MAX_RENDER_CANDIDATES) {
+      candidateSetLimitExceeded = true;
+      recordFailure(
+        builder,
+        `${candidates.length} exports exceeded the ${MAX_RENDER_CANDIDATES}-candidate limit`,
+      );
       continue;
     }
 
@@ -768,43 +810,150 @@ function checkRenderedFingerprint({
       continue;
     }
     if (!payload.ok) {
+      for (const failure of Array.isArray(payload.failures)
+        ? payload.failures.slice(0, MAX_RENDER_CANDIDATES)
+        : []) {
+        recordFailure(
+          builder,
+          `${String(failure?.builderExport ?? "unknown")}: ${String(failure?.reason ?? "failed")}`,
+        );
+      }
       recordFailure(builder, payload.reason ?? "render probe returned no reason");
       continue;
     }
 
     try {
       if (
-        typeof payload.builderExport !== "string" ||
-        !BUILDER_EXPORT_PATTERN.test(payload.builderExport) ||
-        !payload.renders ||
-        typeof payload.renders !== "object"
+        !Array.isArray(payload.candidates) ||
+        payload.candidates.length < 1 ||
+        payload.candidates.length > MAX_RENDER_CANDIDATES
       ) {
         throw new Error("render probe returned an invalid success payload");
       }
-      const modes = {};
-      for (const mode of ["default", "minimal"]) {
-        const rendered = payload.renders[mode];
-        if (typeof rendered !== "string" || rendered.length === 0) {
-          throw new Error(`render probe omitted the ${mode} prompt`);
-        }
-        modes[mode] = {
-          matched: fingerprint.test(rendered),
-          firstLine: rendered.split("\n", 1)[0],
-          headings: rendered
-            .split("\n")
-            .filter((line) => line.startsWith("## ") || line.includes("CACHE_BOUNDARY")),
-        };
+      for (const failure of Array.isArray(payload.failures)
+        ? payload.failures.slice(0, MAX_RENDER_CANDIDATES)
+        : []) {
+        recordFailure(
+          builder,
+          `${String(failure?.builderExport ?? "unknown")}: ${String(failure?.reason ?? "failed")}`,
+        );
       }
-      return { ran: true, builderExport: payload.builderExport, modes };
+      const stagedCandidates = [];
+      for (const candidate of payload.candidates) {
+        if (
+          !candidate ||
+          typeof candidate !== "object" ||
+          typeof candidate.builderExport !== "string" ||
+          !BUILDER_EXPORT_PATTERN.test(candidate.builderExport) ||
+          !candidate.renders ||
+          typeof candidate.renders !== "object"
+        ) {
+          throw new Error("render probe returned an invalid candidate");
+        }
+        const modes = {};
+        for (const mode of ["default", "minimal"]) {
+          const rendered = candidate.renders[mode];
+          if (
+            typeof rendered !== "string" ||
+            rendered.length === 0 ||
+            Buffer.byteLength(rendered, "utf8") > MAX_RENDERED_PROMPT_BYTES
+          ) {
+            throw new Error(`render probe returned an invalid ${mode} prompt`);
+          }
+          modes[mode] = {
+            matched: fingerprint.test(rendered),
+            firstLine: rendered.split("\n", 1)[0].slice(0, 1000),
+            headings: rendered
+              .split("\n")
+              .filter((line) => line.startsWith("## ") || line.includes("CACHE_BOUNDARY"))
+              .slice(0, 100)
+              .map((line) => line.slice(0, 1000)),
+          };
+        }
+        stagedCandidates.push({
+          builderFile: path.relative(installedRoot, builder.file),
+          builderExport: candidate.builderExport,
+          modes,
+        });
+      }
+      if (usableCandidates.length + stagedCandidates.length > MAX_RENDER_CANDIDATES) {
+        candidateSetLimitExceeded = true;
+        recordFailure(
+          builder,
+          `usable candidates exceeded the ${MAX_RENDER_CANDIDATES}-candidate aggregate limit`,
+        );
+        continue;
+      }
+      usableCandidates.push(...stagedCandidates);
     } catch (error) {
       recordFailure(builder, error.message);
       continue;
     }
   }
 
+  if (candidateSetLimitExceeded) {
+    return {
+      ran: false,
+      reason: (
+        `real-render candidates exceeded the ${MAX_RENDER_CANDIDATES}-candidate aggregate ` +
+        `limit: ${failures.join("; ")}`
+      ).slice(0, 900),
+    };
+  }
+
+  if (usableCandidates.length > 0) {
+    usableCandidates.sort((left, right) =>
+      `${left.builderFile}\0${left.builderExport}`.localeCompare(
+        `${right.builderFile}\0${right.builderExport}`,
+      ),
+    );
+    const signatures = new Set(
+      usableCandidates.map((candidate) =>
+        JSON.stringify({
+          default: candidate.modes.default.matched,
+          minimal: candidate.modes.minimal.matched,
+        }),
+      ),
+    );
+    if (signatures.size > 1) {
+      const detail = usableCandidates
+        .slice(0, MAX_RENDER_CANDIDATES)
+        .map(
+          (candidate) =>
+            `${candidate.builderFile}:${candidate.builderExport} ` +
+            `(default=${candidate.modes.default.matched}, minimal=${candidate.modes.minimal.matched})`,
+        )
+        .join("; ");
+      const failureDetail =
+        failures.length > 0 ? ` Non-usable candidates: ${failures.join("; ")}` : "";
+      return {
+        ran: false,
+        reason: (
+          `ambiguous real-render candidates disagree on fingerprint results: ${detail}` +
+          failureDetail
+        ).slice(0, 900),
+        candidateFailures: failures,
+      };
+    }
+    const selected = usableCandidates[0];
+    return {
+      ran: true,
+      builderExport: selected.builderExport,
+      builderCandidates: usableCandidates.map(
+        (candidate) => `${candidate.builderFile}:${candidate.builderExport}`,
+      ),
+      candidateFailures: failures,
+      modes: selected.modes,
+    };
+  }
+
   return {
     ran: false,
-    reason: `all ${builders.length} builder candidate(s) were exhausted: ${failures.join("; ")}`,
+    reason:
+      `all ${builders.length} builder candidate(s) were exhausted: ${failures.join("; ")}`.slice(
+        0,
+        900,
+      ),
   };
 }
 

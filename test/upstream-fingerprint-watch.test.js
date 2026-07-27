@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -160,8 +161,129 @@ export { buildRealAgentSystemPrompt };
     });
     assert.equal(result.ran, true);
     assert.equal(result.builderExport, "buildRealAgentSystemPrompt");
+    assert.match(result.candidateFailures.join("\n"), /decoy cannot render/);
     assert.equal(result.modes.default.matched, true);
     assert.equal(result.modes.minimal.matched, true);
+  } finally {
+    rmSync(workDir, { recursive: true, force: true });
+  }
+});
+
+function checkRenderedBuilderSet(builders) {
+  const workDir = mkdtempSync(path.join(tmpdir(), "fingerprint-watch-candidates-test-"));
+  const result = checkRenderedFingerprint({
+    version: "2026.7.2",
+    fingerprint: /You are OpenClaw\.[\s\S]*## Tooling[\s\S]*## Runtime/,
+    workDir,
+    anchors: ANCHORS,
+    runNpmCommand(_args, { cwd }) {
+      const dist = path.join(cwd, "node_modules", "openclaw", "dist");
+      mkdirSync(dist, { recursive: true });
+      const declarations = ANCHORS.map(
+        (anchor, index) => `const marker${index} = ${JSON.stringify(anchor.literal)};`,
+      ).join("\n");
+      for (const { file, exportName, matches } of builders) {
+        const rendered = matches
+          ? `[${ANCHORS.map((_, index) => `marker${index}`).join(", ")}].join("\\n")`
+          : `"rendered prompt without the fingerprint"`;
+        writeFileSync(
+          path.join(dist, file),
+          `${declarations}
+function ${exportName}() { return ${rendered}; }
+export { ${exportName} };
+`,
+        );
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+  rmSync(workDir, { recursive: true, force: true });
+  return result;
+}
+
+for (const fixture of [
+  [
+    { file: "a-match.mjs", exportName: "buildMatchingAgentSystemPrompt", matches: true },
+    { file: "z-mismatch.mjs", exportName: "buildRejectingAgentSystemPrompt", matches: false },
+  ],
+  [
+    { file: "a-mismatch.mjs", exportName: "buildRejectingAgentSystemPrompt", matches: false },
+    { file: "z-match.mjs", exportName: "buildMatchingAgentSystemPrompt", matches: true },
+  ],
+]) {
+  test(`reports render ambiguity regardless of candidate order (${fixture[0].file} first)`, () => {
+    const result = checkRenderedBuilderSet(fixture);
+    assert.equal(result.ran, false);
+    assert.match(result.reason, /ambiguous real-render candidates disagree/);
+    assert.match(result.reason, /default=true, minimal=true/);
+    assert.match(result.reason, /default=false, minimal=false/);
+  });
+}
+
+test("accepts multiple usable builders that agree and selects deterministically", () => {
+  const result = checkRenderedBuilderSet([
+    { file: "z-match.mjs", exportName: "buildZedAgentSystemPrompt", matches: true },
+    { file: "a-match.mjs", exportName: "buildAlphaAgentSystemPrompt", matches: true },
+  ]);
+  assert.equal(result.ran, true);
+  assert.equal(result.builderExport, "buildAlphaAgentSystemPrompt");
+  assert.deepEqual(result.builderCandidates, [
+    "dist/a-match.mjs:buildAlphaAgentSystemPrompt",
+    "dist/z-match.mjs:buildZedAgentSystemPrompt",
+  ]);
+  assert.equal(result.modes.default.matched, true);
+  assert.equal(result.modes.minimal.matched, true);
+});
+
+test("fails Layer B closed when one quorum file exceeds the export candidate limit", () => {
+  const workDir = mkdtempSync(path.join(tmpdir(), "fingerprint-watch-cap-test-"));
+  try {
+    const result = checkRenderedFingerprint({
+      version: "2026.7.2",
+      fingerprint: /You are OpenClaw\.[\s\S]*## Tooling[\s\S]*## Runtime/,
+      workDir,
+      anchors: ANCHORS,
+      runNpmCommand(_args, { cwd }) {
+        const dist = path.join(cwd, "node_modules", "openclaw", "dist");
+        mkdirSync(dist, { recursive: true });
+        const declarations = ANCHORS.map(
+          (anchor, index) => `const marker${index} = ${JSON.stringify(anchor.literal)};`,
+        ).join("\n");
+        const excessiveExports = [
+          "Alpha",
+          "Beta",
+          "Gamma",
+          "Delta",
+          "Epsilon",
+          "Zeta",
+          "Eta",
+          "Theta",
+          "Iota",
+        ].map((name) => `build${name}AgentSystemPrompt`);
+        writeFileSync(
+          path.join(dist, "a-over-limit.mjs"),
+          `${declarations}
+${excessiveExports.map((name) => `function ${name}() { return "unused"; }`).join("\n")}
+export { ${excessiveExports.join(", ")} };
+`,
+        );
+        writeFileSync(
+          path.join(dist, "z-usable.mjs"),
+          `${declarations}
+function buildUsableAgentSystemPrompt() {
+  return [${ANCHORS.map((_, index) => `marker${index}`).join(", ")}].join("\\n");
+}
+export { buildUsableAgentSystemPrompt };
+`,
+        );
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+
+    assert.equal(result.ran, false);
+    assert.equal("builderExport" in result, false);
+    assert.match(result.reason, /exceeded the 8-candidate aggregate limit/);
+    assert.match(result.reason, /a-over-limit\.mjs: 9 exports exceeded/);
   } finally {
     rmSync(workDir, { recursive: true, force: true });
   }
@@ -209,4 +331,141 @@ test("retains completed targets and reports later fatal target failures", () => 
   assert.match(markdown, /Layer A passed \(partial\)/);
   assert.match(markdown, /openclaw@2026\.7\.2-beta\.1/);
   assert.match(markdown, /No conclusion is available for this target/);
+});
+
+test("embedded publisher keeps a hostile render reason inert in created Markdown", async () => {
+  const workflow = readFileSync(".github/workflows/upstream-watch.yml", "utf8");
+  const marker = "          script: |\n";
+  const start = workflow.indexOf(marker);
+  assert.notEqual(start, -1);
+  const scriptLines = [];
+  for (const line of workflow.slice(start + marker.length).split("\n")) {
+    if (line.length === 0) {
+      scriptLines.push("");
+      continue;
+    }
+    if (!line.startsWith("            ")) break;
+    scriptLines.push(line.slice(12));
+  }
+  const publisherScript = scriptLines.join("\n");
+
+  const anchorIds = [
+    "identity",
+    "tooling",
+    "safety",
+    "workspace",
+    "workspaceFiles",
+    "cacheBoundary",
+    "runtime",
+  ];
+  const hostileReason =
+    "[click](https://evil.example) @octocat **bold** <b>html</b> `tick` " +
+    "<!-- evil-marker --> \u202E\u2066hidden";
+  const versionEntry = (version, tags, { missingIdentity = false, reason }) => ({
+    version,
+    tags,
+    drift: missingIdentity,
+    literalCheck: {
+      ran: true,
+      found: anchorIds
+        .filter((id) => !missingIdentity || id !== "identity")
+        .map((id) => ({ id })),
+      missing: missingIdentity
+        ? [{ id: "identity", literal: "You are OpenClaw.", nearest: [] }]
+        : [],
+    },
+    renderCheck: { ran: false, reason },
+    issueTitle: "artifact-controlled title must be ignored",
+    issueBody: "artifact-controlled body must be ignored",
+    digest: "000000000000",
+  });
+  const report = {
+    incomplete: false,
+    watchedDistTags: ["latest", "beta"],
+    drift: true,
+    versions: [
+      versionEntry("2026.7.2", ["latest"], {
+        missingIdentity: true,
+        reason: hostileReason,
+      }),
+      versionEntry("2026.7.3-beta.1", ["beta"], {
+        reason: "render unavailable",
+      }),
+    ],
+  };
+
+  const createdIssues = [];
+  const listForRepo = async () => {};
+  const listComments = async () => {};
+  const github = {
+    paginate: async (method) => (method === listForRepo ? [] : []),
+    rest: {
+      issues: {
+        createLabel: async () => {},
+        listForRepo,
+        listComments,
+        create: async (input) => {
+          createdIssues.push(input);
+          return { data: { number: 17 } };
+        },
+        createComment: async () => {},
+      },
+    },
+  };
+  const actualRequire = createRequire(import.meta.url);
+  const mockedRequire = (specifier) => {
+    if (specifier === "node:fs") {
+      return {
+        statSync: () => ({ size: JSON.stringify(report).length }),
+        readFileSync: () => JSON.stringify(report),
+      };
+    }
+    if (specifier === "node:child_process") {
+      return {
+        execFileSync: () =>
+          JSON.stringify({ latest: "2026.7.2", beta: "2026.7.3-beta.1" }),
+      };
+    }
+    return actualRequire(specifier);
+  };
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const runPublisher = new AsyncFunction(
+    "require",
+    "process",
+    "github",
+    "context",
+    "core",
+    publisherScript,
+  );
+  await runPublisher(
+    mockedRequire,
+    { env: { REPORT_PATH: "/mock/report.json" } },
+    github,
+    { repo: { owner: "owner", repo: "repo" } },
+    { notice() {}, info() {} },
+  );
+
+  assert.equal(createdIssues.length, 1);
+  assert.equal(
+    createdIssues[0].title,
+    "OpenClaw 2026.7.2: system-prompt fingerprint no longer matches",
+  );
+  assert.doesNotMatch(createdIssues[0].body, /artifact-controlled/);
+  const checksLine = createdIssues[0].body
+    .split("\n")
+    .find((line) => line.startsWith("- **Checks run:**"));
+  assert.ok(checksLine);
+  const firstBacktick = checksLine.indexOf("`");
+  const lastBacktick = checksLine.lastIndexOf("`");
+  assert.notEqual(firstBacktick, -1);
+  assert.ok(lastBacktick > firstBacktick);
+  assert.equal(checksLine.match(/`/g).length, 2);
+  const inertReason = checksLine.slice(firstBacktick + 1, lastBacktick);
+  assert.match(inertReason, /\[click\]\(https:\/\/evil\.example\)/);
+  assert.match(inertReason, /@octocat/);
+  assert.match(inertReason, /\*\*bold\*\*/);
+  assert.match(inertReason, /&lt;b&gt;html&lt;\/b&gt;/);
+  assert.match(inertReason, /&#96;tick&#96;/);
+  assert.match(inertReason, /&lt;!-- evil-marker --&gt;/);
+  assert.doesNotMatch(inertReason, /\p{Cf}/u);
 });

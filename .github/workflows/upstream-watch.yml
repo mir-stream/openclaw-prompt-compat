@@ -164,6 +164,7 @@ jobs:
               }
               return value
                 .replace(/[\u0000-\u001f\u007f]+/g, " ")
+                .replace(/\p{Cf}+/gu, " ")
                 .replace(/<!--/g, "&lt;!--")
                 .replace(/-->/g, "--&gt;")
                 .replace(/`/g, "&#96;")
@@ -367,7 +368,7 @@ jobs:
                   1000,
                   300,
                 );
-                renderCoverage = `(A) anchor literals only — (B) not run: ${reason}`;
+                renderCoverage = `(A) anchor literals only — (B) not run: \`${reason}\``;
               }
 
               normalizedMissing.sort((left, right) => left.id.localeCompare(right.id));

@@ -368,9 +368,10 @@ content quorum에 맞는 파일·export가 여럿이면 한 후보의 import·re
 의존하지 않고, 현행 앵커 리터럴 3개 이상(또는 2개와 정적으로 확인한 prompt-builder export)을 함께
 가진 파일을 찾는다. identity나 `## Tooling` 자체가 사라져도 나머지 앵커로 빌더를 찾아 정상적인
 drift로 보고하기 위한 조건이다. 이 quorum조차 없는 패키지만 빌더 식별 불가 오류로 취급한다.
-원문 substring만 세지 않는다. raw prefilter로 후보 파일을 좁힌 뒤 파일당 한 번 parse해 single/double/
-template literal segment만 index하므로 `//`·`/* */` 주석과 regex source에 남은 옛 앵커는 제외된다.
-실제 string 안의 comment 모양 텍스트와 escaped newline은 정상적인 literal content로 처리한다.
+원문 substring gate를 두지 않는다. 크기 상한 안의 모든 JavaScript 파일을 한 번씩 parse해
+single/double/template literal segment만 index하므로 `\x23`·`\u0023`·`\u{23}` 같은 합법적 escape도
+해독하고, `//`·`/* */` 주석과 regex source에 남은 옛 앵커는 제외한다. 실제 string 안의 comment 모양
+텍스트와 escaped newline은 정상적인 literal content로 처리한다.
 
 캐시 경계 앵커에는 함정이 하나 더 있다. `2026.7.1`부터 `OPENCLAW_CACHE_BOUNDARY` 정의가
 `@openclaw/ai`로 옮겨가서 **openclaw tarball만 grep하면 0건이다**(조사 문서 §8.1). 그대로 두면 정상

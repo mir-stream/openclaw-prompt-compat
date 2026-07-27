@@ -341,7 +341,6 @@ function containsSelfContainedLiteralSegment(segment, anchor) {
  */
 function indexAnchorLiterals(source, anchors, fileName = "upstream.js") {
   const found = new Set();
-  const literalLines = new Set();
   const sourceFile = ts.createSourceFile(
     fileName,
     source,
@@ -359,15 +358,10 @@ function indexAnchorLiterals(source, anchors, fileName = "upstream.js") {
         found.add(anchor.literal);
       }
     }
-    if (segment.length <= 4000) {
-      for (const line of segment.split(/\r?\n/)) {
-        const trimmed = line.trim();
-        if (trimmed.length >= 3) literalLines.add(trimmed);
-      }
-    }
   };
 
   const visit = (node) => {
+    if (found.size === anchors.length) return;
     if (
       ts.isStringLiteral(node) ||
       ts.isNoSubstitutionTemplateLiteral(node) ||
@@ -380,7 +374,31 @@ function indexAnchorLiterals(source, anchors, fileName = "upstream.js") {
     ts.forEachChild(node, visit);
   };
   visit(sourceFile);
-  return { found, literalLines };
+  return { found, sourceFile };
+}
+
+function collectLiteralLines(sourceFile) {
+  const literalLines = new Set();
+  const visit = (node) => {
+    if (
+      ts.isStringLiteral(node) ||
+      ts.isNoSubstitutionTemplateLiteral(node) ||
+      node.kind === ts.SyntaxKind.TemplateHead ||
+      node.kind === ts.SyntaxKind.TemplateMiddle ||
+      node.kind === ts.SyntaxKind.TemplateTail
+    ) {
+      const segment = node.text;
+      if (segment.length <= 4000) {
+        for (const line of segment.split(/\r?\n/)) {
+          const trimmed = line.trim();
+          if (trimmed.length >= 3) literalLines.add(trimmed);
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return literalLines;
 }
 
 /**
@@ -396,9 +414,6 @@ function findBuilderFiles(packageRoot, anchors) {
     for (const file of walkSourceFiles(root)) {
       const source = readIfSmallEnough(file);
       if (source === null) continue;
-      // Current anchors are ASCII source text. This cheap prefilter avoids
-      // constructing an AST for unrelated multi-megabyte bundles.
-      if (!anchors.some((anchor) => source.includes(anchor.literal))) continue;
       const literalIndex = indexAnchorLiterals(source, anchors, file);
       const matchingAnchors = anchors.filter((anchor) =>
         literalIndex.found.has(anchor.literal),
@@ -409,7 +424,14 @@ function findBuilderFiles(packageRoot, anchors) {
       // for split/minified layouts. Crucially, no individual monitored anchor
       // is required: losing identity or Tooling must be reported as drift.
       if (matchingAnchors.length >= 3 || (matchingAnchors.length >= 2 && hasBuilderExport)) {
-        hits.push({ file, source, literalIndex });
+        hits.push({
+          file,
+          source,
+          literalIndex: {
+            found: literalIndex.found,
+            literalLines: collectLiteralLines(literalIndex.sourceFile),
+          },
+        });
       }
     }
     return hits;
@@ -487,7 +509,14 @@ function findNearestLiterals(literalLines, anchor, limit = 3) {
  * on releases where it is present and working. The location each anchor was
  * found at is reported so that a move is legible as a move.
  */
-function checkAnchorLiterals({ anchors, builders, packageRoot, workDir, spec }) {
+function checkAnchorLiterals({
+  anchors,
+  builders,
+  packageRoot,
+  workDir,
+  spec,
+  unpackPackageCommand = unpackPackage,
+}) {
   const found = [];
   let pending = [];
 
@@ -505,12 +534,7 @@ function checkAnchorLiterals({ anchors, builders, packageRoot, workDir, spec }) 
       if (pending.length === 0) break;
       if (builderFiles.has(file)) continue;
       const source = readIfSmallEnough(file);
-      if (
-        source === null ||
-        !pending.some((anchor) => source.includes(anchor.literal))
-      ) {
-        continue;
-      }
+      if (source === null) continue;
       const literalIndex = indexAnchorLiterals(source, pending, file);
       const stillPending = [];
       for (const anchor of pending) {
@@ -533,7 +557,7 @@ function checkAnchorLiterals({ anchors, builders, packageRoot, workDir, spec }) 
       const depDir = path.join(workDir, "deps", dependency.name.replace(/[^a-z0-9]+/gi, "-"));
       let depRoot;
       try {
-        depRoot = unpackPackage(`${dependency.name}@${dependency.range}`, depDir);
+        depRoot = unpackPackageCommand(`${dependency.name}@${dependency.range}`, depDir);
       } catch (error) {
         // A declared dependency we cannot fetch leaves anchors unresolved, and
         // reporting those as drift would be a lie about upstream.
@@ -545,12 +569,7 @@ function checkAnchorLiterals({ anchors, builders, packageRoot, workDir, spec }) 
       for (const file of walkSourceFiles(depRoot)) {
         if (pending.length === 0) break;
         const source = readIfSmallEnough(file);
-        if (
-          source === null ||
-          !pending.some((anchor) => source.includes(anchor.literal))
-        ) {
-          continue;
-        }
+        if (source === null) continue;
         const literalIndex = indexAnchorLiterals(source, pending, file);
         const stillPending = [];
         for (const anchor of pending) {

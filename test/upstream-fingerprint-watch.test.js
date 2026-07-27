@@ -119,6 +119,88 @@ export { buildAgentSystemPrompt };
   }
 });
 
+test("discovers and passes builders whose anchors use legal mixed escapes", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "fingerprint-watch-escapes-test-"));
+  const dist = path.join(root, "dist");
+  mkdirSync(dist);
+  try {
+    writeFileSync(
+      path.join(dist, "system-prompt.js"),
+      [
+        'const identity = "\\u0059ou are OpenClaw.";',
+        'const tooling = "\\x23# Tooling";',
+        "const safety = `\\u{23}# Safety`;",
+        'const workspace = "\\u0023\\x23 Workspace";',
+        'const runtime = "## \\u0052untime";',
+        "function buildAgentSystemPrompt() {",
+        '  return [identity, tooling, safety, workspace, runtime].join("\\n");',
+        "}",
+        "export { buildAgentSystemPrompt };",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(path.join(root, "package.json"), '{"dependencies":{}}\n');
+    const builders = findBuilderFiles(root, ANCHORS);
+    assert.equal(builders.length, 1);
+    const literalCheck = checkAnchorLiterals({
+      anchors: ANCHORS,
+      builders,
+      packageRoot: root,
+      workDir: path.join(root, "work"),
+      spec: "openclaw@test",
+    });
+    assert.deepEqual(literalCheck.missing, []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("finds a sole pending dependency anchor encoded with escapes", () => {
+  const packageRoot = fixtureWithout(null);
+  const dependencyRoot = mkdtempSync(
+    path.join(tmpdir(), "fingerprint-watch-dependency-escapes-test-"),
+  );
+  const cacheAnchor = {
+    id: "cacheBoundary",
+    exportName: "CACHE_BOUNDARY",
+    literal: "<!-- OPENCLAW_CACHE_BOUNDARY -->",
+  };
+  try {
+    writeFileSync(
+      path.join(packageRoot, "package.json"),
+      '{"dependencies":{"@openclaw/ai":"1.0.0"}}\n',
+    );
+    const dependencyDist = path.join(dependencyRoot, "dist");
+    mkdirSync(dependencyDist);
+    writeFileSync(
+      path.join(dependencyDist, "cache-boundary.js"),
+      'export const boundary = "\\x3c!-- OPENCLAW_CACHE_BOUNDARY --\\u003e";\n',
+    );
+    const anchors = [...ANCHORS, cacheAnchor];
+    const builders = findBuilderFiles(packageRoot, anchors);
+    const literalCheck = checkAnchorLiterals({
+      anchors,
+      builders,
+      packageRoot,
+      workDir: path.join(packageRoot, "work"),
+      spec: "openclaw@test",
+      unpackPackageCommand(spec) {
+        assert.equal(spec, "@openclaw/ai@1.0.0");
+        return dependencyRoot;
+      },
+    });
+
+    assert.deepEqual(literalCheck.missing, []);
+    assert.match(
+      literalCheck.found.find((anchor) => anchor.id === "cacheBoundary").location,
+      /^@openclaw\/ai@1\.0\.0:/,
+    );
+  } finally {
+    rmSync(packageRoot, { recursive: true, force: true });
+    rmSync(dependencyRoot, { recursive: true, force: true });
+  }
+});
+
 test("does not let Workspace Files satisfy the Workspace anchor", () => {
   assertMissingAnchorIsDrift(
     "workspace",

@@ -23,7 +23,7 @@ const ANCHORS = [
   { id: "runtime", exportName: "RUNTIME", literal: "## Runtime" },
 ];
 
-function fixtureWithout(missingId) {
+function fixtureWithout(missingId, decoySource = "") {
   const root = mkdtempSync(path.join(tmpdir(), "fingerprint-watch-test-"));
   const dist = path.join(root, "dist");
   mkdirSync(dist);
@@ -33,7 +33,8 @@ function fixtureWithout(missingId) {
     .join("\n");
   writeFileSync(
     path.join(dist, "system-prompt.js"),
-    `${declarations}
+    `${decoySource}
+${declarations}
 function buildAgentSystemPrompt() { return [${present.map((_, index) => `marker${index}`).join(", ")}].join("\\n"); }
 export { buildAgentSystemPrompt };
 `,
@@ -42,8 +43,8 @@ export { buildAgentSystemPrompt };
   return root;
 }
 
-function assertMissingAnchorIsDrift(missingId) {
-  const packageRoot = fixtureWithout(missingId);
+function assertMissingAnchorIsDrift(missingId, decoySource = "") {
+  const packageRoot = fixtureWithout(missingId, decoySource);
   const workDir = path.join(packageRoot, "work");
   mkdirSync(workDir);
   try {
@@ -71,6 +72,58 @@ test("discovers the builder and reports drift when identity is missing", () => {
 
 test("discovers the builder and reports drift when Tooling is missing", () => {
   assertMissingAnchorIsDrift("tooling");
+});
+
+test("does not count an anchor preserved only in a block comment", () => {
+  assertMissingAnchorIsDrift("identity", '/* const old = "You are OpenClaw."; */');
+});
+
+test("does not count an anchor preserved only in a line comment", () => {
+  assertMissingAnchorIsDrift("identity", '// const old = "You are OpenClaw.";');
+});
+
+test("does not count anchor text in a regex literal", () => {
+  assertMissingAnchorIsDrift("safety", "const oldSafetyPattern = /## Safety/;");
+});
+
+test("indexes quote/template segments and comment-looking string content", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "fingerprint-watch-literals-test-"));
+  const dist = path.join(root, "dist");
+  mkdirSync(dist);
+  try {
+    writeFileSync(
+      path.join(dist, "system-prompt.js"),
+      `const identity = 'You are OpenClaw.';
+const tooling = \`## Tooling\${dynamicSuffix}\`;
+const safety = "// still string content\\n## Safety\\n/* still string content */";
+const workspace = "## Workspace";
+const runtime = \`before\\n## Runtime\\nafter\`;
+function buildAgentSystemPrompt() {
+  return [identity, tooling, safety, workspace, runtime].join("\\n");
+}
+export { buildAgentSystemPrompt };
+`,
+    );
+    writeFileSync(path.join(root, "package.json"), '{"dependencies":{}}\n');
+    const builders = findBuilderFiles(root, ANCHORS);
+    const literalCheck = checkAnchorLiterals({
+      anchors: ANCHORS,
+      builders,
+      packageRoot: root,
+      workDir: path.join(root, "work"),
+      spec: "openclaw@test",
+    });
+    assert.deepEqual(literalCheck.missing, []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("does not let Workspace Files satisfy the Workspace anchor", () => {
+  assertMissingAnchorIsDrift(
+    "workspace",
+    'const workspaceFilesOnly = "## Workspace Files (injected)";',
+  );
 });
 
 test("reserves CheckError for a package without enough builder evidence", () => {

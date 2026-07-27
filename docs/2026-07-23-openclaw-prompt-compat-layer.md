@@ -291,7 +291,8 @@ live provider turn, `2026.7.2` GA tarball에 대한 앵커·순서 재확인.
 `alpha`는 보지 않는다. **`beta`를 함께 보는 것이 이 장치의 핵심이다.** 위 사고에서 알 수 있었던 가장
 이른 시점이 beta 게시일이었고, GA를 기다렸다면 이미 늦었다.
 
-검사기는 `scripts/check-upstream-fingerprint.mjs`다. 순수 Node이고 의존성이 없다.
+검사기는 `scripts/check-upstream-fingerprint.mjs`다. Node에서 실행하며, 이미 devDependency인
+TypeScript parser를 (A)의 JavaScript 리터럴 판별에 사용한다.
 `package.json#files`에 `scripts`가 없으므로 npm 배포물에는 들어가지 않는다. 특정 버전을 인자로 주면
 로컬에서도 그대로 돌아간다.
 
@@ -331,7 +332,7 @@ node scripts/check-upstream-fingerprint.mjs 2026.7.1 2026.3.24
 
 | 층 | 방법 | 잡는 것 | 실행 조건 |
 | --- | --- | --- | --- |
-| (A) 앵커 리터럴 존재 | `npm pack` 후 빌더 소스에서 각 앵커 문자열을 찾는다. 코드 실행 없음 | 앵커의 삭제·개작 | 항상 |
+| (A) 앵커 리터럴 존재 | `npm pack` 후 TypeScript parser로 JavaScript string/template literal을 식별해 각 앵커를 찾는다. 코드 실행 없음 | 앵커의 삭제·개작 | 항상 |
 | (B) 실제 렌더 + 지문 대조 | 임시 디렉터리에 설치하고 빌더를 import해 렌더한 뒤 `OPENCLAW_SYSTEM_PROMPT_FINGERPRINT`를 돌린다 | 앵커는 다 있는데 **순서**만 바뀐 경우 | 가능할 때만 |
 
 `2026.7.2` 사고는 (A)만으로 잡힌다. 프리앰블 리터럴이 통째로 사라졌기 때문이다. 실제로 `0.2.0` 지문으로
@@ -367,6 +368,9 @@ content quorum에 맞는 파일·export가 여럿이면 한 후보의 import·re
 의존하지 않고, 현행 앵커 리터럴 3개 이상(또는 2개와 정적으로 확인한 prompt-builder export)을 함께
 가진 파일을 찾는다. identity나 `## Tooling` 자체가 사라져도 나머지 앵커로 빌더를 찾아 정상적인
 drift로 보고하기 위한 조건이다. 이 quorum조차 없는 패키지만 빌더 식별 불가 오류로 취급한다.
+원문 substring만 세지 않는다. raw prefilter로 후보 파일을 좁힌 뒤 파일당 한 번 parse해 single/double/
+template literal segment만 index하므로 `//`·`/* */` 주석과 regex source에 남은 옛 앵커는 제외된다.
+실제 string 안의 comment 모양 텍스트와 escaped newline은 정상적인 literal content로 처리한다.
 
 캐시 경계 앵커에는 함정이 하나 더 있다. `2026.7.1`부터 `OPENCLAW_CACHE_BOUNDARY` 정의가
 `@openclaw/ai`로 옮겨가서 **openclaw tarball만 grep하면 0건이다**(조사 문서 §8.1). 그대로 두면 정상

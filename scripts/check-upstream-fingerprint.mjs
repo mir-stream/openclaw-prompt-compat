@@ -80,6 +80,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import ts from "typescript";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -315,6 +316,73 @@ function readIfSmallEnough(file) {
   }
 }
 
+function containsSelfContainedLiteralSegment(segment, anchor) {
+  let from = 0;
+  for (;;) {
+    const at = segment.indexOf(anchor, from);
+    if (at === -1) return false;
+    const before = at === 0 ? null : segment[at - 1];
+    const afterAt = at + anchor.length;
+    const after = afterAt === segment.length ? null : segment[afterAt];
+    if (
+      (before === null || before === "\n" || before === "\r") &&
+      (after === null || after === "\n" || after === "\r")
+    ) {
+      return true;
+    }
+    from = at + 1;
+  }
+}
+
+/**
+ * Parses one JavaScript source once and indexes only runtime string/template
+ * literal segments. TypeScript's parser supplies lexical context, so quoted
+ * text in comments and regex source is never mistaken for a string literal.
+ */
+function indexAnchorLiterals(source, anchors, fileName = "upstream.js") {
+  const found = new Set();
+  const literalLines = new Set();
+  const sourceFile = ts.createSourceFile(
+    fileName,
+    source,
+    ts.ScriptTarget.Latest,
+    false,
+    ts.ScriptKind.JS,
+  );
+
+  const inspectSegment = (segment) => {
+    for (const anchor of anchors) {
+      if (
+        !found.has(anchor.literal) &&
+        containsSelfContainedLiteralSegment(segment, anchor.literal)
+      ) {
+        found.add(anchor.literal);
+      }
+    }
+    if (segment.length <= 4000) {
+      for (const line of segment.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (trimmed.length >= 3) literalLines.add(trimmed);
+      }
+    }
+  };
+
+  const visit = (node) => {
+    if (
+      ts.isStringLiteral(node) ||
+      ts.isNoSubstitutionTemplateLiteral(node) ||
+      node.kind === ts.SyntaxKind.TemplateHead ||
+      node.kind === ts.SyntaxKind.TemplateMiddle ||
+      node.kind === ts.SyntaxKind.TemplateTail
+    ) {
+      inspectSegment(node.text);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return { found, literalLines };
+}
+
 /**
  * Finds the prompt builder by content, never by filename or one required
  * anchor. The filename changed three times across the sampled releases
@@ -328,8 +396,12 @@ function findBuilderFiles(packageRoot, anchors) {
     for (const file of walkSourceFiles(root)) {
       const source = readIfSmallEnough(file);
       if (source === null) continue;
+      // Current anchors are ASCII source text. This cheap prefilter avoids
+      // constructing an AST for unrelated multi-megabyte bundles.
+      if (!anchors.some((anchor) => source.includes(anchor.literal))) continue;
+      const literalIndex = indexAnchorLiterals(source, anchors, file);
       const matchingAnchors = anchors.filter((anchor) =>
-        containsAnchorLiteral(source, anchor.literal),
+        literalIndex.found.has(anchor.literal),
       );
       const hasBuilderExport = findBuilderExports(source).length > 0;
       // Three independent fingerprint anchors are strong content evidence on
@@ -337,7 +409,7 @@ function findBuilderFiles(packageRoot, anchors) {
       // for split/minified layouts. Crucially, no individual monitored anchor
       // is required: losing identity or Tooling must be reported as drift.
       if (matchingAnchors.length >= 3 || (matchingAnchors.length >= 2 && hasBuilderExport)) {
-        hits.push({ file, source });
+        hits.push({ file, source, literalIndex });
       }
     }
     return hits;
@@ -360,74 +432,6 @@ function findBuilderFiles(packageRoot, anchors) {
 /* -------------------------------------------------------------------------- */
 /* Layer (A): anchor literal presence                                          */
 /* -------------------------------------------------------------------------- */
-
-/**
- * Characters that can legitimately bound a string literal's contents in a
- * bundled source: the quote itself, a template interpolation brace, an escaped
- * newline (the two source characters `\` and `n`), or a real newline in an
- * unminified file.
- *
- * Requiring a boundary is what keeps `## Workspace` from being satisfied by the
- * `## Workspace Files (injected)` line it prefixes — the same prefix trap the
- * fingerprint itself guards against with a trailing `\n`.
- */
-const BOUNDARY_CHARS = new Set(['"', "'", "`", "}", "{", "\n", "\r"]);
-
-function isLiteralBoundary(source, index, direction) {
-  if (index < 0 || index >= source.length) return true; // start/end of file
-  const char = source[index];
-  if (BOUNDARY_CHARS.has(char)) return true;
-  if (direction === "before") {
-    // `...\n` — an escaped newline ends at `index`, so look at index-1..index.
-    return char === "n" && source[index - 1] === "\\";
-  }
-  // `\n...` — an escaped newline starts at `index`.
-  if (char === "\\" && source[index + 1] === "n") return true;
-  // `${` opening a template interpolation directly after the anchor.
-  return char === "$" && source[index + 1] === "{";
-}
-
-/** True when `anchor` appears as a self-contained line inside a string literal. */
-function containsAnchorLiteral(source, anchor) {
-  let from = 0;
-  for (;;) {
-    const at = source.indexOf(anchor, from);
-    if (at === -1) return false;
-    if (
-      isLiteralBoundary(source, at - 1, "before") &&
-      isLiteralBoundary(source, at + anchor.length, "after")
-    ) {
-      return true;
-    }
-    from = at + 1;
-  }
-}
-
-/**
- * Pulls the individual lines out of every quoted string literal.
- *
- * Only used to suggest what a missing anchor may have turned into, so an
- * imprecise tokenization is acceptable here. The authoritative presence test is
- * {@link containsAnchorLiteral}, which needs no tokenizer at all.
- */
-const QUOTED_LITERAL_PATTERN = /"((?:[^"\\\n]|\\.)*)"|'((?:[^'\\\n]|\\.)*)'/g;
-
-function extractLiteralLines(source) {
-  const lines = new Set();
-  for (const match of source.matchAll(QUOTED_LITERAL_PATTERN)) {
-    const raw = match[1] ?? match[2] ?? "";
-    if (raw.length === 0 || raw.length > 4000) continue;
-    const decoded = raw
-      .replace(/\\n/g, "\n")
-      .replace(/\\t/g, "\t")
-      .replace(/\\(["'\\])/g, "$1");
-    for (const line of decoded.split("\n")) {
-      const trimmed = line.trim();
-      if (trimmed.length >= 3) lines.add(trimmed);
-    }
-  }
-  return lines;
-}
 
 function tokenize(text) {
   return new Set(
@@ -484,12 +488,11 @@ function findNearestLiterals(literalLines, anchor, limit = 3) {
  * found at is reported so that a move is legible as a move.
  */
 function checkAnchorLiterals({ anchors, builders, packageRoot, workDir, spec }) {
-  const builderSource = builders.map((builder) => builder.source).join("\n");
   const found = [];
   let pending = [];
 
   for (const anchor of anchors) {
-    if (containsAnchorLiteral(builderSource, anchor.literal)) {
+    if (builders.some((builder) => builder.literalIndex.found.has(anchor.literal))) {
       found.push({ ...anchor, location: "builder" });
     } else {
       pending.push(anchor);
@@ -498,21 +501,30 @@ function checkAnchorLiterals({ anchors, builders, packageRoot, workDir, spec }) 
 
   if (pending.length > 0) {
     const builderFiles = new Set(builders.map((builder) => builder.file));
-    const stillPending = [];
-    for (const anchor of pending) {
-      let location = null;
-      for (const file of walkSourceFiles(packageRoot)) {
-        if (builderFiles.has(file)) continue;
-        const source = readIfSmallEnough(file);
-        if (source !== null && containsAnchorLiteral(source, anchor.literal)) {
-          location = `${path.relative(packageRoot, file)} (same package)`;
-          break;
+    for (const file of walkSourceFiles(packageRoot)) {
+      if (pending.length === 0) break;
+      if (builderFiles.has(file)) continue;
+      const source = readIfSmallEnough(file);
+      if (
+        source === null ||
+        !pending.some((anchor) => source.includes(anchor.literal))
+      ) {
+        continue;
+      }
+      const literalIndex = indexAnchorLiterals(source, pending, file);
+      const stillPending = [];
+      for (const anchor of pending) {
+        if (literalIndex.found.has(anchor.literal)) {
+          found.push({
+            ...anchor,
+            location: `${path.relative(packageRoot, file)} (same package)`,
+          });
+        } else {
+          stillPending.push(anchor);
         }
       }
-      if (location) found.push({ ...anchor, location });
-      else stillPending.push(anchor);
+      pending = stillPending;
     }
-    pending = stillPending;
   }
 
   if (pending.length > 0) {
@@ -530,24 +542,37 @@ function checkAnchorLiterals({ anchors, builders, packageRoot, workDir, spec }) 
             `not present in the release itself, but it could not be fetched: ${error.message}`,
         );
       }
-      const stillPending = [];
-      for (const anchor of pending) {
-        let location = null;
-        for (const file of walkSourceFiles(depRoot)) {
-          const source = readIfSmallEnough(file);
-          if (source !== null && containsAnchorLiteral(source, anchor.literal)) {
-            location = `${dependency.name}@${dependency.range}:${path.relative(depRoot, file)}`;
-            break;
+      for (const file of walkSourceFiles(depRoot)) {
+        if (pending.length === 0) break;
+        const source = readIfSmallEnough(file);
+        if (
+          source === null ||
+          !pending.some((anchor) => source.includes(anchor.literal))
+        ) {
+          continue;
+        }
+        const literalIndex = indexAnchorLiterals(source, pending, file);
+        const stillPending = [];
+        for (const anchor of pending) {
+          if (literalIndex.found.has(anchor.literal)) {
+            found.push({
+              ...anchor,
+              location:
+                `${dependency.name}@${dependency.range}:` +
+                path.relative(depRoot, file),
+            });
+          } else {
+            stillPending.push(anchor);
           }
         }
-        if (location) found.push({ ...anchor, location });
-        else stillPending.push(anchor);
+        pending = stillPending;
       }
-      pending = stillPending;
     }
   }
 
-  const literalLines = pending.length > 0 ? extractLiteralLines(builderSource) : new Set();
+  const literalLines = new Set(
+    builders.flatMap((builder) => [...builder.literalIndex.literalLines]),
+  );
   const missing = pending.map((anchor) => ({
     id: anchor.id,
     literal: anchor.literal,

@@ -26,8 +26,8 @@
  * acquired, so that the fragile layer cannot take the reliable one with it:
  *
  *   (A) Anchor literal presence — always runs. Unpacks the tarball with
- *       `npm pack`, identifies the prompt builder by content, and checks that
- *       each anchor still exists as a string literal. No dependency
+ *       `npm pack`, identifies the prompt builder by a quorum of the current
+ *       anchors, and checks that each anchor still exists as a string literal. No dependency
  *       resolution, no code execution. The 2026.7.2 incident is caught by
  *       this layer alone: the preamble literal vanished outright.
  *
@@ -312,18 +312,27 @@ function readIfSmallEnough(file) {
 }
 
 /**
- * Finds the prompt builder by content, never by filename. The filename changed
- * three times across the sampled releases (`pi-embedded-*` → `system-prompt-*`
- * → `system-prompt-config-*` → `system-prompt-params-*`), while "the file that
- * contains both the identity sentence and the Tooling heading" held throughout.
+ * Finds the prompt builder by content, never by filename or one required
+ * anchor. The filename changed three times across the sampled releases
+ * (`pi-embedded-*` → `system-prompt-*` → `system-prompt-config-*` →
+ * `system-prompt-params-*`). A quorum still identifies the builder when one
+ * monitored anchor is exactly the thing upstream removed.
  */
-function findBuilderFiles(packageRoot, identityLiteral, toolingLiteral) {
+function findBuilderFiles(packageRoot, anchors) {
   const search = (root) => {
     const hits = [];
     for (const file of walkSourceFiles(root)) {
       const source = readIfSmallEnough(file);
       if (source === null) continue;
-      if (source.includes(identityLiteral) && source.includes(toolingLiteral)) {
+      const matchingAnchors = anchors.filter((anchor) =>
+        containsAnchorLiteral(source, anchor.literal),
+      );
+      const hasBuilderExport = findBuilderExports(source).length > 0;
+      // Three independent fingerprint anchors are strong content evidence on
+      // their own. Two plus a statically visible builder export is also enough
+      // for split/minified layouts. Crucially, no individual monitored anchor
+      // is required: losing identity or Tooling must be reported as drift.
+      if (matchingAnchors.length >= 3 || (matchingAnchors.length >= 2 && hasBuilderExport)) {
         hits.push({ file, source });
       }
     }
@@ -336,10 +345,9 @@ function findBuilderFiles(packageRoot, identityLiteral, toolingLiteral) {
 
   if (hits.length === 0) {
     throw new CheckError(
-      `no prompt builder found under ${packageRoot}: no file contains both ` +
-        `the identity sentence and ${JSON.stringify(toolingLiteral)}. ` +
-        `Either the release layout changed or the identity sentence itself did — ` +
-        `both need a human before this watch can judge anything.`,
+      `no prompt builder found under ${packageRoot}: no file contains at least three ` +
+        `fingerprint anchors (or two plus a prompt-builder export). The release is ` +
+        `not identifiable enough for this watch to judge.`,
     );
   }
   return hits;
@@ -642,7 +650,13 @@ try {
  * Layer (B). Every exit path that is not "the fingerprint was tested" reports
  * `ran: false` with a reason; none of them report drift.
  */
-function checkRenderedFingerprint({ version, fingerprint, workDir, anchors }) {
+function checkRenderedFingerprint({
+  version,
+  fingerprint,
+  workDir,
+  anchors,
+  runNpmCommand = runNpm,
+}) {
   const installDir = path.join(workDir, "install");
   const homeDir = path.join(workDir, "home");
   const workspaceDir = path.join(workDir, "workspace");
@@ -664,18 +678,26 @@ function checkRenderedFingerprint({ version, fingerprint, workDir, anchors }) {
     OPENCLAW_CONFIG_PATH: path.join(homeDir, "openclaw.json"),
   };
 
-  const install = runNpm(
-    [
-      "install",
-      `openclaw@${version}`,
-      "--ignore-scripts",
-      "--no-audit",
-      "--no-fund",
-      "--loglevel",
-      "error",
-    ],
-    { cwd: installDir, env: isolatedEnv, timeout: INSTALL_TIMEOUT_MS },
-  );
+  let install;
+  try {
+    install = runNpmCommand(
+      [
+        "install",
+        `openclaw@${version}`,
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+        "--loglevel",
+        "error",
+      ],
+      { cwd: installDir, env: isolatedEnv, timeout: INSTALL_TIMEOUT_MS },
+    );
+  } catch (error) {
+    return {
+      ran: false,
+      reason: `npm install openclaw@${version} could not run: ${error.message}`,
+    };
+  }
   if (install.status !== 0) {
     return {
       ran: false,
@@ -690,11 +712,7 @@ function checkRenderedFingerprint({ version, fingerprint, workDir, anchors }) {
 
   let builders;
   try {
-    builders = findBuilderFiles(
-      installedRoot,
-      anchors.find((anchor) => anchor.id === "identity").literal,
-      anchors.find((anchor) => anchor.id === "tooling").literal,
-    );
+    builders = findBuilderFiles(installedRoot, anchors);
   } catch (error) {
     return { ran: false, reason: `builder not found in installed tree: ${error.message}` };
   }
@@ -771,11 +789,7 @@ function inspectVersion({ version, tags, anchors, fingerprint, rootWorkDir, skip
 
   const spec = `openclaw@${version}`;
   const packageRoot = unpackPackage(spec, path.join(workDir, "pack"));
-  const builders = findBuilderFiles(
-    packageRoot,
-    anchors.find((anchor) => anchor.id === "identity").literal,
-    anchors.find((anchor) => anchor.id === "tooling").literal,
-  );
+  const builders = findBuilderFiles(packageRoot, anchors);
 
   const literalCheck = checkAnchorLiterals({ anchors, builders, packageRoot, workDir, spec });
 
@@ -828,7 +842,12 @@ function renderHumanReport(results) {
   for (const result of results) {
     const tagSuffix = result.tags.length > 0 ? ` [${result.tags.join(", ")}]` : "";
     lines.push("");
-    lines.push(`openclaw@${result.version}${tagSuffix} — ${result.drift ? "DRIFT" : "PASS"}`);
+    const status = result.drift
+      ? "DRIFT"
+      : result.renderCheck.ran
+        ? "PASS"
+        : "LAYER A PASS (PARTIAL)";
+    lines.push(`openclaw@${result.version}${tagSuffix} — ${status}`);
     lines.push(`  checks run: ${describeCoverage(result)}`);
     lines.push(`  builder:    ${result.builderFiles.join(", ")}`);
 
@@ -861,14 +880,42 @@ function renderHumanReport(results) {
 
   const drifted = results.filter((result) => result.drift);
   lines.push("");
-  lines.push(
-    drifted.length === 0
-      ? `All ${results.length} watched release(s) still carry the fingerprint.`
-      : `Fingerprint drift in ${drifted.length} of ${results.length} watched release(s): ${drifted
-          .map((result) => result.version)
-          .join(", ")}`,
-  );
+  if (drifted.length > 0) {
+    lines.push(
+      `Fingerprint drift in ${drifted.length} of ${results.length} watched release(s): ${drifted
+        .map((result) => result.version)
+        .join(", ")}`,
+    );
+  } else if (results.some((result) => !result.renderCheck.ran)) {
+    lines.push(
+      `Layer (A) passed for all ${results.length} watched release(s); coverage is partial, ` +
+        "so the full fingerprint was not verified for every release.",
+    );
+  } else {
+    lines.push(`All ${results.length} watched release(s) passed the full fingerprint check.`);
+  }
   return lines.join("\n");
+}
+
+function renderMarkdownReport(results) {
+  return results
+    .map((result) => {
+      if (result.drift) return renderIssueBody(result);
+      const tags = result.tags.length > 0 ? ` (${result.tags.join(", ")})` : "";
+      const verdict = result.renderCheck.ran
+        ? "The anchor literals and real rendered prompt both passed."
+        : "Layer (A) found every anchor literal. Coverage is partial; the full fingerprint was not verified.";
+      return [
+        `## openclaw@${result.version}${tags}`,
+        "",
+        `- **Status:** ${result.renderCheck.ran ? "full fingerprint passed" : "Layer A passed (partial)"}`,
+        `- **Checks run:** ${describeCoverage(result)}`,
+        `- **Prompt builder:** \`${result.builderFiles.join("`, `")}\``,
+        "",
+        verdict,
+      ].join("\n");
+    })
+    .join("\n\n---\n\n");
 }
 
 /** A stable id for one drift finding, so the workflow can tell repeats from changes. */
@@ -1079,7 +1126,7 @@ async function main() {
     mkdirSync(path.dirname(path.resolve(options.markdown)), { recursive: true });
     writeFileSync(
       options.markdown,
-      drifted.map((result) => renderIssueBody(result)).join("\n\n---\n\n") || "No drift.\n",
+      `${renderMarkdownReport(results)}\n`,
     );
     process.stdout.write(`Markdown report: ${options.markdown}\n`);
   }
@@ -1096,11 +1143,27 @@ async function main() {
   process.exitCode = 0;
 }
 
-main().catch((error) => {
-  if (error instanceof CheckError) {
-    process.stderr.write(`\nupstream fingerprint watch failed: ${error.message}\n`);
-  } else {
-    process.stderr.write(`\nupstream fingerprint watch crashed:\n${error?.stack ?? error}\n`);
-  }
-  process.exitCode = 1;
-});
+const isMain =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+
+if (isMain) {
+  main().catch((error) => {
+    if (error instanceof CheckError) {
+      process.stderr.write(`\nupstream fingerprint watch failed: ${error.message}\n`);
+    } else {
+      process.stderr.write(`\nupstream fingerprint watch crashed:\n${error?.stack ?? error}\n`);
+    }
+    process.exitCode = 1;
+  });
+}
+
+export {
+  CheckError,
+  checkAnchorLiterals,
+  checkRenderedFingerprint,
+  describeCoverage,
+  findBuilderFiles,
+  renderHumanReport,
+  renderMarkdownReport,
+};

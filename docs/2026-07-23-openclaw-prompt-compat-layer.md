@@ -350,15 +350,18 @@ monolithic CLI 번들 안에 있어 import만으로 `~/.openclaw`를 읽고 boot
 (조사 문서 §8.1). 방어는 두 겹이다. 첫째, import할 export를 `export {}` 절에서 **정적으로** 고른다.
 프롬프트 빌더를 export하지 않는 번들은 애초에 import되지 않는다 — `2026.3.24`가 여기서 걸러진다.
 둘째, 실제로 일어나는 import는 `HOME`을 임시 디렉터리로 바꾼 자식 프로세스에서 타임아웃과 함께 돈다.
-(B)가 못 돌면 "(A)만 수행됨"으로 보고하고 **drift로 취급하지 않는다.** 돌지 못한 검사는 업스트림에
-대해 아무것도 말해주지 않는다.
+(B)의 설치가 시작되지 못하거나 timeout된 경우를 포함해, (B)가 못 돌면 "(A)만 수행됨"으로 보고하고
+**drift로 취급하지 않는다.** 돌지 못한 검사는 업스트림에 대해 아무것도 말해주지 않는다.
 
-리포트는 어떤 검사가 실제로 돌았는지 항상 명시한다. (A)만 돌았는데 "전부 통과"로 읽히면 안 된다.
+콘솔·Markdown·Actions summary는 버전마다 어떤 검사가 실제로 돌았는지 항상 명시한다. (A)만 돌았으면
+"Layer A 통과(부분 검사)"라고 쓰며 전체 지문이 일치한다고 말하지 않는다.
 
 ### 6.2 빌더 파일은 이름이 아니라 내용으로 찾는다
 
-빌더 파일명은 조사 기간 중 세 번 바뀌었다(조사 문서 §5.1). 따라서 identity 문장과 `## Tooling`을 함께
-포함하는 파일을 찾는다. 이 조건은 11개 릴리스 전부에서 유일한 파일을 지목했다.
+빌더 파일명은 조사 기간 중 세 번 바뀌었다(조사 문서 §5.1). 따라서 특정 파일명이나 개별 앵커에
+의존하지 않고, 현행 앵커 리터럴 3개 이상(또는 2개와 정적으로 확인한 prompt-builder export)을 함께
+가진 파일을 찾는다. identity나 `## Tooling` 자체가 사라져도 나머지 앵커로 빌더를 찾아 정상적인
+drift로 보고하기 위한 조건이다. 이 quorum조차 없는 패키지만 빌더 식별 불가 오류로 취급한다.
 
 캐시 경계 앵커에는 함정이 하나 더 있다. `2026.7.1`부터 `OPENCLAW_CACHE_BOUNDARY` 정의가
 `@openclaw/ai`로 옮겨가서 **openclaw tarball만 grep하면 0건이다**(조사 문서 §8.1). 그대로 두면 정상
@@ -375,6 +378,12 @@ ok  cacheBoundary "<!-- OPENCLAW_CACHE_BOUNDARY -->"  <- @openclaw/ai@2026.7.1:d
 신호는 깨진 앵커가 적힌 이슈다. 반대로 **검사기 자체가 고장나면 exit 1로 실패한다** — 네트워크 실패,
 tarball 손상, 빌더 식별 불가. 이때는 아무것도 검사되지 않은 것이므로 drift와는 다른, 더 나쁜 사건이다.
 step summary도 "검사가 안 돌았다"와 "검사했는데 문제 없다"를 다르게 쓴다.
+
+권한 경계도 두 job으로 나뉜다. `check` job은 `contents: read`만 갖고 checkout credential을 남기지
+않은 채 (A)/(B)를 실행해 리포트 artifact를 만든다. `issues: write`는 별도 runner의 `publish` job만
+가지며, 이 job은 checkout이나 OpenClaw import를 하지 않고 artifact의 JSON schema를 검증한 뒤 이슈
+API만 호출한다. 같은 schedule/manual 실행이 겹쳐 중복 이슈를 만들지 않도록 workflow 전용
+concurrency group도 직렬화한다.
 
 drift가 있으면 `upstream-drift` 라벨로 이슈를 연다. 매일 도는 잡이므로 중복 방지가 필수다. 이슈 본문에
 두 개의 HTML 주석 마커를 심어 상태를 이슈 자체에 보관한다. 외부 저장소도 workflow state도 쓰지 않는다.

@@ -23,16 +23,26 @@ on:
 
 permissions:
   contents: read
-  issues: write
+
+concurrency:
+  group: upstream-fingerprint-watch
+  cancel-in-progress: false
 
 jobs:
-  watch:
+  check:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      drift: ${{ steps.check.outputs.drift }}
+      drift_versions: ${{ steps.check.outputs.drift_versions }}
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -68,16 +78,101 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+      # "The check did not run" and "the check found nothing" must not read the
+      # same, or a broken watch looks like a healthy one. The Markdown report
+      # includes every watched version, including healthy and partial results.
+      - name: Summarize
+        if: always()
+        env:
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+          REPORT_MD: ${{ runner.temp }}/fingerprint-report.md
+        run: |
+          if [ "$CHECK_OUTCOME" != "success" ]; then
+            {
+              echo "### Fingerprint watch did not complete"
+              echo
+              echo "The check step ended as \`$CHECK_OUTCOME\`, so nothing was verified."
+              echo "This is a failure of the watch, not a finding about upstream."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            cat "$REPORT_MD" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  publish:
+    needs: check
+    if: needs.check.result == 'success' && needs.check.outputs.drift == 'true'
+    permissions:
+      issues: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # This job intentionally performs no checkout and executes no upstream
+      # package code. Its only input from the unprivileged check job is a
+      # schema-validated JSON artifact.
+      - name: Download report
+        uses: actions/download-artifact@v4
+        with:
+          name: fingerprint-report
+          path: ${{ runner.temp }}/fingerprint-report
+
       - name: Open or update drift issue
-        if: steps.check.outputs.drift == 'true'
         uses: actions/github-script@v7
         env:
-          REPORT_PATH: ${{ runner.temp }}/fingerprint-report.json
+          REPORT_PATH: ${{ runner.temp }}/fingerprint-report/fingerprint-report.json
         with:
           script: |
             const fs = require("node:fs");
             const report = JSON.parse(fs.readFileSync(process.env.REPORT_PATH, "utf8"));
             const LABEL = "upstream-drift";
+
+            const fail = (message) => {
+              throw new Error(`Invalid fingerprint report: ${message}`);
+            };
+            if (!report || typeof report !== "object" || Array.isArray(report)) fail("root must be an object");
+            if (report.drift !== true) fail("drift must be true in a publication report");
+            if (!Array.isArray(report.versions) || report.versions.length < 1 || report.versions.length > 20) {
+              fail("versions must contain 1-20 entries");
+            }
+            for (const [index, version] of report.versions.entries()) {
+              if (!version || typeof version !== "object" || Array.isArray(version)) {
+                fail(`versions[${index}] must be an object`);
+              }
+              if (
+                typeof version.version !== "string" ||
+                !/^[0-9A-Za-z][0-9A-Za-z.+-]{0,127}$/.test(version.version)
+              ) {
+                fail(`versions[${index}].version is invalid`);
+              }
+              if (typeof version.drift !== "boolean") fail(`versions[${index}].drift must be boolean`);
+              if (
+                typeof version.digest !== "string" ||
+                !/^[a-f0-9]{12}$/.test(version.digest)
+              ) {
+                fail(`versions[${index}].digest is invalid`);
+              }
+              if (
+                typeof version.issueTitle !== "string" ||
+                version.issueTitle.length < 1 ||
+                version.issueTitle.length > 256
+              ) {
+                fail(`versions[${index}].issueTitle is invalid`);
+              }
+              if (version.drift) {
+                if (
+                  typeof version.issueBody !== "string" ||
+                  version.issueBody.length < 1 ||
+                  version.issueBody.length > 60000
+                ) {
+                  fail(`versions[${index}].issueBody is invalid`);
+                }
+              } else if (version.issueBody !== null) {
+                fail(`versions[${index}].issueBody must be null without drift`);
+              }
+            }
+            if (!report.versions.some((version) => version.drift)) {
+              fail("drift is true but no version is drifted");
+            }
 
             // Ensure the label exists before filtering on it, so the very first
             // drift does not depend on someone having created it by hand.
@@ -155,32 +250,3 @@ jobs:
               });
               core.notice(`Commented on #${existing.number} for openclaw@${version.version}`);
             }
-
-      # "The check did not run" and "the check found nothing" must not read the
-      # same, or a broken watch looks like a healthy one.
-      - name: Summarize
-        if: always()
-        env:
-          CHECK_OUTCOME: ${{ steps.check.outcome }}
-          DRIFT: ${{ steps.check.outputs.drift }}
-          DRIFT_VERSIONS: ${{ steps.check.outputs.drift_versions }}
-          REPORT_MD: ${{ runner.temp }}/fingerprint-report.md
-        run: |
-          if [ "$CHECK_OUTCOME" != "success" ]; then
-            {
-              echo "### Fingerprint watch did not complete"
-              echo
-              echo "The check step ended as \`$CHECK_OUTCOME\`, so nothing was verified."
-              echo "This is a failure of the watch, not a finding about upstream."
-            } >> "$GITHUB_STEP_SUMMARY"
-          elif [ "$DRIFT" = "true" ]; then
-            {
-              echo "### Fingerprint drift detected"
-              echo
-              echo "Affected: \`$DRIFT_VERSIONS\`"
-              echo
-              cat "$REPORT_MD"
-            } >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "The fingerprint still matches every watched OpenClaw release." >> "$GITHUB_STEP_SUMMARY"
-          fi

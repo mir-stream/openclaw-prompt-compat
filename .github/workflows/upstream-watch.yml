@@ -492,7 +492,11 @@ jobs:
               });
               const alreadyReported =
                 (existing.body ?? "").includes(digestMarker) ||
-                comments.some((comment) => (comment.body ?? "").includes(digestMarker));
+                comments.some(
+                  (comment) =>
+                    comment.user?.login === "github-actions[bot]" &&
+                    (comment.body ?? "").includes(digestMarker),
+                );
 
               if (alreadyReported) {
                 core.info(

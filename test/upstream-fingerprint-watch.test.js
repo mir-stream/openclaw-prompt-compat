@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -468,7 +469,7 @@ test("retains completed targets and reports later fatal target failures", () => 
   assert.match(markdown, /No conclusion is available for this target/);
 });
 
-test("embedded publisher keeps a hostile render reason inert in created Markdown", async () => {
+function loadPublisherScript() {
   const workflow = readFileSync(".github/workflows/upstream-watch.yml", "utf8");
   const marker = "          script: |\n";
   const start = workflow.indexOf(marker);
@@ -482,7 +483,11 @@ test("embedded publisher keeps a hostile render reason inert in created Markdown
     if (!line.startsWith("            ")) break;
     scriptLines.push(line.slice(12));
   }
-  const publisherScript = scriptLines.join("\n");
+  return scriptLines.join("\n");
+}
+
+test("embedded publisher keeps a hostile render reason inert in created Markdown", async () => {
+  const publisherScript = loadPublisherScript();
 
   const anchorIds = [
     "identity",
@@ -603,4 +608,117 @@ test("embedded publisher keeps a hostile render reason inert in created Markdown
   assert.match(inertReason, /&#96;tick&#96;/);
   assert.match(inertReason, /&lt;!-- evil-marker --&gt;/);
   assert.doesNotMatch(inertReason, /\p{Cf}/u);
+});
+
+async function runPublisherWithMatchingDigestComment(commentLogin) {
+  const publisherScript = loadPublisherScript();
+  const version = "2026.7.2";
+  const anchorIds = [
+    "identity",
+    "tooling",
+    "safety",
+    "workspace",
+    "workspaceFiles",
+    "cacheBoundary",
+    "runtime",
+  ];
+  const shape = JSON.stringify({
+    version,
+    missing: ["identity"],
+    unmatched: [],
+  });
+  const digest = createHash("sha256").update(shape).digest("hex").slice(0, 12);
+  const report = {
+    incomplete: false,
+    watchedDistTags: ["latest", "beta"],
+    drift: true,
+    versions: [
+      {
+        version,
+        tags: ["latest", "beta"],
+        drift: true,
+        literalCheck: {
+          ran: true,
+          found: anchorIds
+            .filter((id) => id !== "identity")
+            .map((id) => ({ id })),
+          missing: [{ id: "identity", literal: "You are OpenClaw.", nearest: [] }],
+        },
+        renderCheck: { ran: false, reason: "render unavailable" },
+      },
+    ],
+  };
+  const versionMarker = `<!-- upstream-fingerprint-watch version=${version} -->`;
+  const digestMarker = `<!-- upstream-fingerprint-watch digest=${digest} -->`;
+  const createdComments = [];
+  const listForRepo = async () => {};
+  const listComments = async () => {};
+  const github = {
+    paginate: async (method) => {
+      if (method === listForRepo) {
+        return [{ number: 23, body: versionMarker }];
+      }
+      if (method === listComments) {
+        return [{ body: digestMarker, user: { login: commentLogin } }];
+      }
+      throw new Error("Unexpected pagination method");
+    },
+    rest: {
+      issues: {
+        createLabel: async () => {},
+        listForRepo,
+        listComments,
+        create: async () => {
+          throw new Error("Existing version issue should be reused");
+        },
+        createComment: async (input) => {
+          createdComments.push(input);
+        },
+      },
+    },
+  };
+  const actualRequire = createRequire(import.meta.url);
+  const mockedRequire = (specifier) => {
+    if (specifier === "node:fs") {
+      return {
+        statSync: () => ({ size: JSON.stringify(report).length }),
+        readFileSync: () => JSON.stringify(report),
+      };
+    }
+    if (specifier === "node:child_process") {
+      return {
+        execFileSync: () => JSON.stringify({ latest: version, beta: version }),
+      };
+    }
+    return actualRequire(specifier);
+  };
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const runPublisher = new AsyncFunction(
+    "require",
+    "process",
+    "github",
+    "context",
+    "core",
+    publisherScript,
+  );
+  await runPublisher(
+    mockedRequire,
+    { env: { REPORT_PATH: "/mock/report.json" } },
+    github,
+    { repo: { owner: "owner", repo: "repo" } },
+    { notice() {}, info() {} },
+  );
+  return createdComments;
+}
+
+test("untrusted matching digest comment does not suppress drift publication", async () => {
+  const createdComments = await runPublisherWithMatchingDigestComment("attacker");
+  assert.equal(createdComments.length, 1);
+  assert.equal(createdComments[0].issue_number, 23);
+});
+
+test("trusted workflow bot matching digest comment suppresses duplicate publication", async () => {
+  const createdComments =
+    await runPublisherWithMatchingDigestComment("github-actions[bot]");
+  assert.equal(createdComments.length, 0);
 });

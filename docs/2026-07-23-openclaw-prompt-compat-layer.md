@@ -2,7 +2,7 @@
 
 작성: 2026-07-23
 상태: **`0.3.0` 지문 앵커 교체를 코드에 반영 완료, npm 게시 전. npm `latest`는 여전히 `0.2.0`이고
-그 버전의 게시본 acceptance(install·mock outbound·live turn)까지는 완료돼 있다. setup 배포 전**
+그 버전의 게시본 acceptance(install·mock outbound)까지는 완료돼 있다. setup 배포 전**
 검증 기준: OpenClaw `2026.7.1` (`v2026.7.1`, commit
 `2d2ddc43d0dcf71f31283d780f9fe9ff4cc04fe4`). 지문 자체는 `2026.7.2-beta.4`의 실제 렌더까지 실측으로
 검증했으나(5.3), 이는 지문이 match하는 범위일 뿐이다. 지원 하한은 `>=2026.7.1` 그대로다.
@@ -201,16 +201,9 @@ openclaw plugins install \
 | 정확한 host | OpenClaw `2026.7.1` (`2d2ddc4`) runtime load 성공 |
 | 게시본 plugin 활성 mock outbound | system=`within`, 같은 원문 user 메시지=`inside` |
 | plugin 비활성 mock outbound | system·user 모두=`inside`로 복원 |
-| Z.AI live Gateway turn | `zai/glm-5.2`, `status: ok`, 응답 `ZAI_COMPAT_OK` |
-| Z.AI provider-bound system | cache trace 첫 줄=`within` |
-| 비밀정보 비영속성 | 임시 config·state·session·trace·log에서 API key 원문 없음 |
 
 mock outbound 검증은 실제 OpenClaw embedded runner가 OpenAI-compatible local endpoint로 보낸 payload를
 캡처했다. 이 검증으로 system 첫 줄이 바뀌면서 standalone user copy는 유지되는 것을 직접 확인했다.
-
-Z.AI 검증은 별도 임시 `HOME`, `OPENCLAW_STATE_DIR`, `OPENCLAW_CONFIG_PATH`에서 foreground Gateway를
-기동해 수행했다. API key는 process environment에만 넣었고 onboarding, auth profile, config, `.env`에는
-기록하지 않았다. 검증 후 Gateway를 종료하고 환경변수를 해제했다.
 
 ### 5.2 `0.2.0` (2026-07-27)
 
@@ -228,10 +221,6 @@ Z.AI 검증은 별도 임시 `HOME`, `OPENCLAW_STATE_DIR`, `OPENCLAW_CONFIG_PATH
 | 같은 turn user 메시지 | 원문 identity 문장을 한 줄로 포함해도 `inside` 그대로 유지 |
 | 설정 없는 mock outbound | system 첫 줄=기본값 `within` (`0.1.0` 동작과 동일) |
 | plugin 비활성 mock outbound | system 첫 줄=원문 `inside`로 복원 |
-| Z.AI live turn | `zailive/glm-5.2`, `stopReason: stop`, 응답 `ZAI_COMPAT_OK` |
-| live provider-bound system | cache trace 첫 줄=설정값 `You are the live acceptance probe assistant.`, 원문·기본 문장 모두 부재 |
-| live user 메시지 | 원문 identity 한 줄을 그대로 유지 (오염 없음) |
-| 비밀정보 비영속성 | 임시 config·state·log·capture에서 API key 원문 없음 |
 
 `config set`의 value 모드 dry-run은 스키마 검증을 건너뛴다. non-interactive setup에서 잘못된 키나
 미설치 버전을 조용히 기록하지 않으려면 검증이 도는 batch 모드를 쓴다.
@@ -244,15 +233,6 @@ payload를 캡처해 판정했다. `agent --local`은 호출마다 새 프로세
 실측으로 확인된 payload 형태는 다음과 같다. system은 분할되지 않은 단일 `system` role 메시지 하나이고,
 `<!-- OPENCLAW_CACHE_BOUNDARY -->`는 outbound payload에 존재하지 않는다. 캐시 경계는 전송 전에 제거되고
 provider에게는 stable·dynamic이 합쳐진 하나의 system 문자열이 나간다.
-
-live turn은 같은 격리 환경에서 provider만 실제 Z.AI로 바꿔 수행했다. API key는 process environment로만
-전달했고 config에는 env를 가리키는 SecretRef만 기록했다. 검증 후 key를 unset하고 임시 파일을 지웠으며,
-config·state·log·capture에 key 원문이 남지 않았음을 확인했다.
-
-live 판정 근거는 cache trace(`OPENCLAW_CACHE_TRACE=1`)의 `stream:context` 이벤트다. `agent --json`의
-`systemPromptReport`는 hash와 chars만 주고, trajectory의 `context.compiled`는 32,768자를 넘으면 통째로
-버려져 첫 줄이 사라진다. cache trace의 wrapper는 모든 transform이 끝난 뒤 transport 직전에 값을 보므로
-wire에 가장 가깝다. 다만 이 지점에서는 cache boundary sentinel이 아직 남아 있다(전송 직전에 제거).
 
 `0.2.0` 게시본에 대해 미실행으로 남은 검증은 없다.
 
@@ -274,11 +254,11 @@ wire에 가장 가깝다. 다만 이 지점에서는 cache boundary sentinel이 
 
 실제 렌더 검증은 각 OpenClaw 버전을 설치한 뒤 **프롬프트 빌더 함수를 직접 import해 렌더한 출력**을
 입력으로 판정했다. 게이트웨이를 기동해 outbound 경로에서 뽑은 캡처가 아니므로, 5.1·5.2의 mock
-outbound·live turn 검증과는 층위가 다르다. 빌더 렌더는 프롬프트 조립 결과를 보고, outbound 캡처는
+outbound 검증과는 층위가 다르다. 빌더 렌더는 프롬프트 조립 결과를 보고, outbound 캡처는
 transform 등록·적용까지 포함한 wire 값을 본다.
 
 미실행으로 남은 검증은 다음과 같다. npm 게시, 게시본의 managed install·mock outbound acceptance,
-live provider turn, `2026.7.2` GA tarball에 대한 앵커·순서 재확인.
+`2026.7.2` GA tarball에 대한 앵커·순서 재확인.
 
 ## 6. 업스트림 지문 감시
 
@@ -450,8 +430,7 @@ API이고 match 실패는 런타임 문자열마다 발생하므로 별도 설�
 - runtime inspect의 종료코드만 믿지 않고 `status=loaded`, `imported=true`와 active module
   root가 managed install path인지 함께 확인한다. config-selected 동일 ID local copy가 shadowing하면
   성공으로 처리하지 않는다.
-- setup은 검증 후 Gateway를 재시작한다. 실제 agent turn 검증은 릴리스 수용 테스트에서 별도로
-  수행한다.
+- setup은 검증 후 Gateway를 재시작한다.
 
 npm package가 게시되기 전에는 이 setup 변경을 공개 배포하지 않는다. 로컬 코드 통합과 shell 검증을
 먼저 끝내고, 해당 version 게시 후 package install acceptance를 다시 통과시킨 뒤 배포한다. `0.2.0`은
@@ -484,19 +463,16 @@ setup 재실행은 명시적 disable을 보존한다. 완전 제거 후 setup을
 - [x] 단위 테스트와 package dry-run이 통과했다.
 - [x] packed artifact가 OpenClaw `2026.7.1` managed npm 경로에서 설치·load됐다.
 - [x] 실제 outbound payload에서 system 첫 줄만 바뀌고 standalone user copy는 유지됐다.
-- [x] Z.AI Coding Plan live agent turn이 성공했다.
 - [x] `@mir-stream/openclaw-prompt-compat@0.1.0`을 npm에 게시한다.
 - [x] 게시된 npm artifact로 package acceptance를 다시 실행한다.
 - [x] identity 교체 문장을 `identitySentence`로 설정 가능하게 만든다.
 - [x] `@mir-stream/openclaw-prompt-compat@0.2.0`을 npm에 게시한다.
 - [x] `0.2.0` 게시본으로 managed install과 mock outbound acceptance를 재실행한다.
-- [x] `0.2.0` 게시본으로 live provider turn을 재확인한다.
 - [x] 지문에서 산문 앵커를 제거하고 구조 앵커로 교체한다.
 - [x] 업스트림 릴리스에 대한 지문 감시를 자동화한다(§6). 사용자 환경에서의 치환 실패 관측은 별건이고
       여전히 미해결이다(§6.4).
 - [ ] `@mir-stream/openclaw-prompt-compat@0.3.0`을 npm에 게시한다.
 - [ ] `0.3.0` 게시본으로 managed install과 mock outbound acceptance를 실행한다.
-- [ ] `0.3.0` 게시본으로 live provider turn을 확인한다.
 - [ ] `2026.7.2` GA tarball로 앵커·순서를 재확인한다.
 - [ ] `setup_openclaw` 변경을 배포하고 새 설치·재실행·disable 보존을 확인한다.
 
@@ -506,4 +482,3 @@ setup 재실행은 명시적 disable을 보존한다. 완전 제거 후 setup을
 - [`registerTextTransforms`와 재귀 message 변환](https://github.com/openclaw/openclaw/blob/v2026.7.1/src/agents/plugin-text-transforms.ts)
 - [provider system prompt transform](https://github.com/openclaw/openclaw/blob/v2026.7.1/src/plugins/provider-runtime.ts)
 - [외부 plugin package 작성 계약](https://github.com/openclaw/openclaw/blob/v2026.7.1/docs/plugins/building-plugins.md)
-- [Z.AI provider 설정](https://github.com/openclaw/openclaw/blob/v2026.7.1/docs/providers/zai.md)

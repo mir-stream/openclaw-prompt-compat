@@ -1,0 +1,329 @@
+name: Release
+
+# v0.3.0 sat unpublished on npm for weeks because publishing was a manual step
+# nobody owned: CI stopped at `npm pack --dry-run`, and the fix for the 2026.7.2
+# silent no-op never reached a single user. This workflow removes the human step.
+# Pushing a `vX.Y.Z` tag is now the whole release procedure.
+#
+# The repo's rule for the plugin is fail closed rather than do the wrong thing
+# quietly, and a release is the one place where the wrong thing is permanent:
+# npm versions cannot be re-published once taken. So every gate here refuses to
+# publish rather than guessing, and prints the values it compared.
+#
+# ONE-TIME SETUP REQUIRED ON npmjs.com — without it, tagging fails at publish.
+# Trusted publishing (OIDC) replaces NPM_TOKEN; this repo deliberately holds no
+# publish secret. On npmjs.com → @mir-stream/openclaw-prompt-compat → Settings →
+# Trusted Publisher, register:
+#
+#   Provider:          GitHub Actions
+#   Organization/user: mir-stream
+#   Repository:        openclaw-prompt-compat
+#   Workflow filename: release.yml      (filename only, not a path)
+#   Environment:       (leave empty — this workflow uses no GitHub environment)
+#   Allowed actions:   npm publish      (at least this one must be ticked, or
+#                                        the registration looks complete and
+#                                        publishing still fails)
+#
+# Renaming this file breaks publishing until the registration is updated to
+# match, because npm matches on the workflow filename.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Deliberately no `workflow_dispatch`. A manual run has no tag, so the version
+# gate below would have nothing to compare against — and an untagged publish is
+# precisely the accident this workflow exists to prevent.
+
+permissions:
+  contents: read
+
+concurrency:
+  # A single global group, not one per tag: two releases publishing at once is
+  # the thing to avoid, not two runs of the same tag.
+  #
+  # `queue: max` is load-bearing, not a tuning knob. The default is `queue:
+  # single`, which cancels whatever is already pending and puts the newcomer in
+  # its place — so `git push --tags` with v0.3.0, v0.3.1 and v0.3.2 outstanding
+  # would let the third cancel the second, and v0.3.1 would never publish. A
+  # cancelled run is grey, raises no failure notification and prints no
+  # `::error::`: the silent no-op this repo exists to prevent, occurring in the
+  # release path itself. `queue: max` holds up to 100 runs in FIFO order.
+  #
+  # `cancel-in-progress: false` because cancelling mid-publish is worse than
+  # waiting — it can leave npm published with no GitHub Release, or the reverse.
+  # It is also the only value compatible with `queue: max`.
+  group: npm-release
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # There is deliberately no "did the tag move?" check here, and adding one
+      # would be dead code. checkout@v4 fetches `+${github.sha}:${github.ref}`,
+      # forcing the pushed commit into the local tag ref before checking it out,
+      # so this job always verifies the tree at `github.sha` no matter where the
+      # remote tag points by now — `git rev-parse HEAD` could never disagree.
+      # `publish` pins `ref: github.sha` explicitly for the same guarantee. The
+      # one place the commit is genuinely not pinned is `release`, which creates
+      # from the remote tag; that is checked there, at the point it matters.
+      #
+      # fetch-depth defaults to 1, which is not enough to ask whether this
+      # commit is on main. The ancestry check below is the reason for depth 0.
+      # persist-credentials: false keeps the job token out of .git/config while
+      # npm ci and the test suite run third-party lifecycle scripts; the repo is
+      # public, so the anonymous fetch below still works.
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Without this, any commit on any branch could be tagged and published.
+      # The explicit fetch does not rely on what fetch-depth: 0 happened to
+      # populate, so a missing ref is a hard failure rather than a skipped check.
+      - name: Assert the tagged commit is reachable from main
+        env:
+          PUSHED_SHA: ${{ github.sha }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          git fetch --no-tags --quiet origin refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$PUSHED_SHA" refs/remotes/origin/main; then
+            echo "Tag:            $TAG_NAME"
+            echo "Tagged commit:  $PUSHED_SHA"
+            echo "::error::The tagged commit is not reachable from main. Refusing to publish off-branch code."
+            exit 1
+          fi
+
+      # The header above declares the tag contract as `vX.Y.Z`; this gate is what
+      # actually enforces it. The trigger glob is `v*` and every gate below is a
+      # string comparison, so `v0.4.0-rc.1` matched in all three places would
+      # sail through — and `npm publish` without `--tag` would move `latest` to
+      # that RC. `install.npmSpec` in package.json carries no version, so
+      # `openclaw plugins install` resolves `latest` and every new user would get
+      # the prerelease. A published version cannot be reused, so that is not
+      # undoable. Narrowing the trigger glob instead would hide the rule in a
+      # place nobody reads before widening it again.
+      - name: Assert the tag is a plain release version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if ! printf '%s' "$TAG_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Tag: $TAG_NAME"
+            echo "::error::Tag is not a plain vX.Y.Z release version. Prereleases would take the npm latest tag, which is not reversible. Nothing was published."
+            exit 1
+          fi
+
+      # This repo carries the version in two independent places: package.json
+      # (what npm publishes) and openclaw.plugin.json (what OpenClaw reads at
+      # load time). Nothing keeps them in step, so the realistic accident is
+      # shipping a package whose plugin manifest claims a different version —
+      # which then makes every downstream version report a lie. All three values
+      # are printed on failure so the log alone says which one drifted.
+      - name: Assert tag, package.json and openclaw.plugin.json agree
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          TAG_VERSION="${TAG_NAME#v}"
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          PLUGIN_VERSION="$(node -p "require('./openclaw.plugin.json').version")"
+          echo "tag:                   $TAG_NAME  (version: $TAG_VERSION)"
+          echo "package.json:          $PACKAGE_VERSION"
+          echo "openclaw.plugin.json:  $PLUGIN_VERSION"
+          if [ "$TAG_VERSION" != "$PACKAGE_VERSION" ] || [ "$TAG_VERSION" != "$PLUGIN_VERSION" ]; then
+            echo "::error::Version mismatch between the tag, package.json and openclaw.plugin.json. Nothing was published."
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # CI runs on branches and pull requests, not necessarily on the exact
+      # commit that got tagged. Re-running the full suite here means a release
+      # is never published on the assumption that someone else checked it.
+      - name: Run tests
+        run: npm test
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+  publish:
+    needs: verify
+    permissions:
+      # id-token: write is what makes trusted publishing work — npm exchanges
+      # this OIDC token for a short-lived publish credential, so the repo needs
+      # no NPM_TOKEN. Keep `contents` at read: this job must not be able to
+      # write to the repository.
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # Pinned to the pushed commit rather than the tag ref, so a tag moved
+      # after `verify` passed cannot substitute different code at publish time.
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      # `registry-url` names the registry the OIDC exchange targets and points
+      # NPM_CONFIG_USERCONFIG at the .npmrc holding it. NODE_AUTH_TOKEN is
+      # deliberately not set: trusted publishing replaces it, and this repo
+      # keeps no publish secret at all.
+      #
+      # Node 24 here, while `verify` stays on 22 so the tests run at the low end
+      # of the supported engines range. Trusted publishing needs npm >= 11.5.1,
+      # and Node 22 still bundles npm 10.9.8 — but every Node 24 in the engines
+      # range ships enough (24.15.0 → npm 11.12.1). Choosing the runtime is what
+      # removes the need to install npm during a release: a floating
+      # `npm install -g npm@latest` on the publish path means a future npm major
+      # dropping this Node line breaks releases with nothing in this repo having
+      # changed, and it would be found by whoever next pushes a tag.
+      #
+      # `cache: npm` is deliberately absent here while `verify` keeps it. This
+      # is the only job holding id-token: write, and actions/setup-node warns
+      # that a poisoned dependency cache can expose credentials — the OIDC token
+      # included — to attacker-controlled code. `verify` runs with no token, on
+      # its own checkout, and this job reinstalls from scratch regardless, so
+      # dropping the cache costs nothing that matters here.
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
+
+      # setup-node@v4 writes `_authToken=${NODE_AUTH_TOKEN}` into that .npmrc
+      # whenever registry-url is set, then exports NODE_AUTH_TOKEN as the
+      # literal placeholder `XXXXX-XXXXX-XXXXX-XXXXX` when no real token exists
+      # (see src/authutil.ts in the v4 branch). npm would send that dead
+      # credential and never attempt the OIDC exchange, so publishing would fail
+      # as an ordinary auth error with nothing pointing at the real cause.
+      # setup-node v7 dropped the placeholder and its docs therefore need no
+      # such step; on the v4 pin this repo uses, the line has to go. Removing it
+      # is safe exactly because trusted publishing authenticates without a token.
+      - name: Remove the placeholder auth line written by setup-node@v4
+        run: |
+          NPMRC="${NPM_CONFIG_USERCONFIG:-$HOME/.npmrc}"
+          if [ ! -f "$NPMRC" ]; then
+            echo "Expected npm config at: $NPMRC"
+            echo "::error::setup-node wrote no .npmrc, so registry-url was not applied. This is a setup-node problem, NOT an npm Trusted Publisher registration problem. Failing before publish rather than guessing."
+            exit 1
+          fi
+          sed -i '/_authToken=/d' "$NPMRC"
+          # Confirm the removal instead of assuming the pattern still matches.
+          # If setup-node changes the .npmrc format, the placeholder survives,
+          # npm sends a dead credential and fails as a plain 401 — which the
+          # step below would then misattribute to a missing registration.
+          if grep -q '_authToken' "$NPMRC"; then
+            echo "::error::An _authToken line survived in $NPMRC. setup-node's .npmrc format has probably changed, so the placeholder-stripping pattern no longer matches. This is NOT an npm Trusted Publisher registration problem."
+            exit 1
+          fi
+          echo "npm config in effect (no credential is expected below):"
+          cat "$NPMRC"
+
+      - name: Install dependencies
+        run: npm ci
+
+      # No `--provenance`: under trusted publishing npm generates and publishes
+      # provenance attestations automatically, and passing the flag explicitly
+      # is redundant.
+      #
+      # This step depends entirely on `prepack` running `tsc`. `dist/` is the
+      # first line of .gitignore and no file under it is tracked, so the
+      # checkout genuinely has no dist/ at all. Without prepack, `files:
+      # ["dist", ...]` would match nothing and npm would permanently accept a
+      # tarball whose `main`, `types` and `exports` all point at files that do
+      # not exist — installable, impossible to load, and the version number can
+      # never be reused.
+      - name: Publish to npm
+        id: publish
+        run: npm publish
+
+      # npm reports a missing trusted publisher as a 404 or ENEEDAUTH, which
+      # reads like a typo in the package name or a missing token. Say the real
+      # thing out loud so the next person does not go hunting for a secret that
+      # this repo intentionally does not have. This message can afford to be
+      # that confident only because the placeholder-credential path fails
+      # earlier with its own diagnosis, so registration is what genuinely
+      # remains once execution reaches here.
+      - name: Explain a publish failure
+        if: failure() && steps.publish.outcome == 'failure'
+        run: |
+          echo "::error::npm publish failed. If the error mentions 404, ENEEDAUTH or authentication, the most likely cause is that the Trusted Publisher for @mir-stream/openclaw-prompt-compat is not registered on npmjs.com, or was registered with a workflow filename other than release.yml. See the header comment in this file."
+
+  release:
+    needs: publish
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # Ordered strictly after `publish` for a reason: a GitHub Release created
+      # alongside a failed publish is a release that looks shipped and is not.
+      # A successful publish with no Release is merely untidy; the reverse
+      # misleads everyone reading the releases page.
+      #
+      # Recovering the "published, no release" case is not obvious, so: do NOT
+      # use "Re-run all jobs". `npm publish` fails with E403 on a version that
+      # already exists, so the run dies in `publish` and never reaches here.
+      # Use "Re-run failed jobs", or run `gh release create` by hand. Either way
+      # it exits non-zero if the release already exists.
+      #
+      # This job needs no checkout — `gh` and `git ls-remote` both address the
+      # repository over the network, so the one job holding contents: write
+      # never has a working tree.
+      #
+      # npm was given `github.sha`, but `gh release create` resolves the tag name
+      # on the server right now and `--verify-tag` only asks whether the tag
+      # exists at all. A tag repointed between publishing and this step would
+      # attach the release to a different commit than the tarball was built
+      # from, and nothing would say so. Both refs are compared because an
+      # annotated tag reports the tag object's SHA on the bare ref and the
+      # commit only under `^{}` — this repo's existing v0.1.0 is annotated, so
+      # comparing the bare ref alone would never match.
+      - name: Assert the remote tag still points at the published commit
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          PUBLISHED_SHA: ${{ github.sha }}
+        run: |
+          REFS="$(git ls-remote "https://github.com/${REPO}.git" \
+            "refs/tags/${TAG_NAME}" "refs/tags/${TAG_NAME}^{}")"
+          echo "Published commit: $PUBLISHED_SHA"
+          echo "Remote tag now resolves to:"
+          echo "${REFS:-  (nothing — the tag is gone)}"
+          if ! printf '%s\n' "$REFS" | awk '{print $1}' | grep -qx "$PUBLISHED_SHA"; then
+            echo "::error::Tag $TAG_NAME no longer points at $PUBLISHED_SHA. That commit is ALREADY PUBLISHED to npm as $TAG_NAME; only the GitHub Release was skipped. Repoint or restore the tag to $PUBLISHED_SHA and re-run this job, or deprecate the npm version — the tag and the published tarball currently disagree."
+            exit 1
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release create "$TAG_NAME" \
+            --repo "$REPO" \
+            --title "$TAG_NAME" \
+            --generate-notes \
+            --verify-tag

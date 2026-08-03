@@ -9,12 +9,29 @@ permissions:
 
 jobs:
   verify:
+    # Restated per job even though the top-level block already grants exactly
+    # this. Every job in release.yml and upstream-watch.yml states its own scope,
+    # because that is where a job's real permissions are decided — publish adds
+    # id-token: write, release takes contents: write, the drift publisher takes
+    # issues: write. Against that convention a job with no block reads as an
+    # omission rather than a decision, and the next job added here has no local
+    # example to copy from.
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
+      # persist-credentials: false keeps the job token out of .git/config while
+      # npm ci and the test suite run third-party lifecycle scripts. Nothing in
+      # this job touches a git remote — it installs, tests, type-checks, builds
+      # and packs — so removing the credential costs nothing. If a step is ever
+      # added that does need to fetch or push, this is the line that will make
+      # it fail, and it has to be reconsidered deliberately rather than deleted.
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@v4

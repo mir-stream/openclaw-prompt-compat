@@ -222,19 +222,37 @@ jobs:
       - name: Remove the placeholder auth line written by setup-node@v4
         run: |
           NPMRC="${NPM_CONFIG_USERCONFIG:-$HOME/.npmrc}"
-          if [ -f "$NPMRC" ]; then
-            sed -i '/_authToken=/d' "$NPMRC"
-            echo "npm config in effect (no credential is expected below):"
-            cat "$NPMRC"
+          if [ ! -f "$NPMRC" ]; then
+            echo "Expected npm config at: $NPMRC"
+            echo "::error::setup-node wrote no .npmrc, so registry-url was not applied. This is a setup-node problem, NOT an npm Trusted Publisher registration problem. Failing before publish rather than guessing."
+            exit 1
           fi
+          sed -i '/_authToken=/d' "$NPMRC"
+          # Confirm the removal instead of assuming the pattern still matches.
+          # If setup-node changes the .npmrc format, the placeholder survives,
+          # npm sends a dead credential and fails as a plain 401 — which the
+          # step below would then misattribute to a missing registration.
+          if grep -q '_authToken' "$NPMRC"; then
+            echo "::error::An _authToken line survived in $NPMRC. setup-node's .npmrc format has probably changed, so the placeholder-stripping pattern no longer matches. This is NOT an npm Trusted Publisher registration problem."
+            exit 1
+          fi
+          echo "npm config in effect (no credential is expected below):"
+          cat "$NPMRC"
 
       - name: Install dependencies
         run: npm ci
 
       # No `--provenance`: under trusted publishing npm generates and publishes
       # provenance attestations automatically, and passing the flag explicitly
-      # is redundant. `prepack` rebuilds dist/ from this checkout, so the
-      # published tarball never contains a stale build.
+      # is redundant.
+      #
+      # This step depends entirely on `prepack` running `tsc`. `dist/` is the
+      # first line of .gitignore and no file under it is tracked, so the
+      # checkout genuinely has no dist/ at all. Without prepack, `files:
+      # ["dist", ...]` would match nothing and npm would permanently accept a
+      # tarball whose `main`, `types` and `exports` all point at files that do
+      # not exist — installable, impossible to load, and the version number can
+      # never be reused.
       - name: Publish to npm
         id: publish
         run: npm publish
@@ -242,7 +260,10 @@ jobs:
       # npm reports a missing trusted publisher as a 404 or ENEEDAUTH, which
       # reads like a typo in the package name or a missing token. Say the real
       # thing out loud so the next person does not go hunting for a secret that
-      # this repo intentionally does not have.
+      # this repo intentionally does not have. This message can afford to be
+      # that confident only because the placeholder-credential path fails
+      # earlier with its own diagnosis, so registration is what genuinely
+      # remains once execution reaches here.
       - name: Explain a publish failure
         if: failure() && steps.publish.outcome == 'failure'
         run: |
